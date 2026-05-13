@@ -114,7 +114,6 @@ def date_to_yyyymmdd(date_text: str) -> str:
             return dt.strftime("%Y%m%d")
         except ValueError:
             continue
-    # Today / Yesterday / weekday — use current date best-effort
     lower = raw.lower()
     if lower == "today":
         return datetime.now().strftime("%Y%m%d")
@@ -127,8 +126,6 @@ def slugify(s: str, max_len: int = 60) -> str:
     s = re.sub(r"\s+", "_", s)
     return s[:max_len] or "channel"
 
-
-# ---------------- DOM 抽取（评估 JS，一次拿全） ----------------
 
 EXTRACT_MESSAGES_JS = """
 () => {
@@ -144,7 +141,6 @@ EXTRACT_MESSAGES_JS = """
       const id = m.getAttribute('data-message-id');
       const cls = m.className || '';
       const contentClass = m.querySelector('.message-content')?.className || '';
-      // 提取文本：clone & remove MessageMeta & WebPage description（avoid mixing link-preview meta into the user text）
       let text = '';
       const tc = m.querySelector('.text-content');
       if (tc) {
@@ -152,11 +148,9 @@ EXTRACT_MESSAGES_JS = """
         clone.querySelectorAll('.MessageMeta, .message-time, .message-views').forEach(n => n.remove());
         text = (clone.innerText || '').trim();
       }
-      // 文件名
       let fileName = '';
       const ft = m.querySelector('.File .file-title');
       if (ft) fileName = (ft.getAttribute('title') || ft.innerText || '').trim();
-      // 相册子项
       const albumItems = [];
       m.querySelectorAll("[id^='album-media-message-']").forEach(it => {
         const subId = (it.getAttribute('id') || '').replace('album-media-message-','');
@@ -165,9 +159,7 @@ EXTRACT_MESSAGES_JS = """
         albumItems.push({ subId, hasVideo, hasImg });
       });
       items.push({
-        id,
-        cls,
-        contentClass,
+        id, cls, contentClass,
         isFirstInGroup: cls.includes('first-in-group'),
         isLastInGroup: cls.includes('last-in-group'),
         isActionMessage: cls.includes('ActionMessage'),
@@ -183,7 +175,6 @@ EXTRACT_MESSAGES_JS = """
     });
     if (items.length) out.dateGroups.push({ dateText, items });
   }
-  // first / last visible message ids
   const all = document.querySelectorAll('.Transition_slide-active .message-list-item[data-message-id]');
   if (all.length) {
     out.firstVisibleId = all[0].getAttribute('data-message-id');
@@ -194,11 +185,7 @@ EXTRACT_MESSAGES_JS = """
 """
 
 
-# ---------------- 工具：右键下载 ----------------
-
-
 async def _close_any_open_menu(page: Page) -> None:
-    """关闭任何已开的 context menu。"""
     try:
         cnt = await page.locator(CONTEXT_MENU_ROOT).count()
         if cnt > 0:
@@ -214,12 +201,8 @@ async def right_click_download(
     page: Page,
     locator: Locator,
     timeout_ms: int = 90000,
-    max_attempts: int = 3,
+    max_attempts: int = 2,
 ) -> Optional[Download]:
-    """
-    在元素上右键，等待菜单出现，找 Download 项，再用 expect_download 包裹点击。
-    若菜单没有 Download 项则按 Esc 关闭并返回 None。
-    """
     for attempt in range(max_attempts):
         await _close_any_open_menu(page)
         try:
@@ -231,7 +214,6 @@ async def right_click_download(
         except Exception:
             pass
         await page.wait_for_timeout(500)
-        # 直接用 JS 派发 contextmenu 事件，让 React 接收（最稳）
         try:
             await locator.evaluate(
                 """el => {
@@ -246,20 +228,17 @@ async def right_click_download(
             )
         except Exception as e:
             log(f"  JS 派发 contextmenu 失败 (attempt {attempt+1}): {e}")
-            # 兜底：playwright 物理右键
             try:
                 await locator.click(button="right", force=True, timeout=5000)
             except Exception as e2:
                 log(f"  物理右键也失败: {e2}")
                 continue
-        # 等菜单出现（用 .MenuItem 而非 .Menu，因为 root 是 0x0 portal 容器）
         menu_item_any = page.locator(CONTEXT_MENU_ITEM).first
         try:
             await menu_item_any.wait_for(state="visible", timeout=4000)
         except PlaywrightTimeoutError:
             log(f"  右键菜单未出现 (attempt {attempt+1})")
             continue
-        # 找 Download 项
         download_item = page.locator(f"{CONTEXT_MENU_ITEM}:has-text('Download')").first
         try:
             if not await download_item.is_visible():
@@ -269,7 +248,6 @@ async def right_click_download(
         except Exception:
             await _close_any_open_menu(page)
             return None
-        # 用 expect_download 包裹点击
         try:
             async with page.expect_download(timeout=timeout_ms) as di:
                 await download_item.click()
@@ -298,9 +276,6 @@ async def save_download(download: Download, dest: Path) -> Optional[Path]:
         return None
 
 
-# ---------------- 单条消息处理 ----------------
-
-
 async def process_message(
     page: Page,
     msg_data: dict,
@@ -311,34 +286,19 @@ async def process_message(
     only_kinds: Optional[set[str]] = None,
     skip_kinds: Optional[set[str]] = None,
 ) -> dict:
-    """
-    msg_data 是 JS 抽取出来的字典，msg_locator 是页面定位器。返回处理结果记录。
-    """
     msg_id = msg_data["id"]
     text = msg_data.get("text", "") or ""
     text_pre = text_preview(text, 30)
     base = f"{msg_id}__{text_pre}"
-    record: dict[str, Any] = {
-        "msg_id": msg_id,
-        "text_pre": text_pre,
-        "kinds": [],
-        "saved": [],
-        "errors": [],
-        "skipped": False,
-    }
+    record: dict[str, Any] = {"msg_id": msg_id, "text_pre": text_pre, "kinds": [], "saved": [], "errors": [], "skipped": False}
 
     if msg_data.get("isActionMessage"):
         record["kinds"].append("action")
         return record
 
-    # 检查跳过：组目录里已经有 msg_id__ 开头的非 text/html 文件 → 媒体已下载，仍重写文本
     existing_media = list(group_dir.glob(f"{msg_id}__*")) if group_dir.exists() else []
-    has_media_files = any(
-        not (p.name.endswith("__text.txt") or p.name.endswith("__raw.html"))
-        for p in existing_media
-    )
+    has_media_files = any(not (p.name.endswith("__text.txt") or p.name.endswith("__raw.html")) for p in existing_media)
 
-    # 保存原始 HTML（重型证据）
     raw_html_path = group_dir / safe_filename(f"{base}__raw.html")
     if not raw_html_path.exists():
         try:
@@ -348,7 +308,6 @@ async def process_message(
         except Exception as e:
             record["errors"].append(f"raw.html: {e}")
 
-    # 保存文本
     text_path = group_dir / safe_filename(f"{base}__text.txt")
     try:
         group_dir.mkdir(parents=True, exist_ok=True)
@@ -356,7 +315,6 @@ async def process_message(
     except Exception as e:
         record["errors"].append(f"text.txt: {e}")
 
-    # 媒体已存且 skip_existing → 跳过媒体下载
     if skip_existing and has_media_files:
         record["skipped"] = True
         record["kinds"].append("media-skipped")
@@ -369,7 +327,6 @@ async def process_message(
             return False
         return True
 
-    # 1) 文件
     if msg_data.get("hasFile"):
         record["kinds"].append("file")
         if kind_enabled("file"):
@@ -390,7 +347,6 @@ async def process_message(
                 else:
                     record["errors"].append("file-no-download")
 
-    # 2) 相册
     if msg_data.get("hasAlbum"):
         record["kinds"].append("album")
         if kind_enabled("album"):
@@ -405,7 +361,6 @@ async def process_message(
                 except Exception:
                     pass
                 if ai.get("hasVideo"):
-                    dest = group_dir / safe_filename(f"{base}__album_{sub_id}__video.mp4")
                     log(f"  → album video sub={sub_id}")
                     dl = await right_click_download(page, item_loc, timeout_ms=120000)
                     if dl:
@@ -417,7 +372,6 @@ async def process_message(
                             record["saved"].append(saved.name)
                     else:
                         record["errors"].append(f"album-video-{sub_id}-no-download")
-                # 截图缩略图作为图片
                 try:
                     thumb = item_loc.locator("img.full-media, img.thumbnail, canvas.thumbnail").first
                     if await thumb.count() > 0 and await thumb.is_visible():
@@ -429,14 +383,13 @@ async def process_message(
                 except Exception as e:
                     record["errors"].append(f"album-photo-{sub_id}: {e}")
 
-    # 3) 单条视频 / media（非相册）
     if msg_data.get("hasMediaInner") and not msg_data.get("hasAlbum") and not msg_data.get("hasWebPage"):
         record["kinds"].append("video")
         if kind_enabled("video"):
             media = msg_locator.locator(MEDIA_INNER).first
             if await media.count() > 0:
-                log(f"  → video msg={msg_id}")
-                dl = await right_click_download(page, media, timeout_ms=180000)
+                log(f"  → video msg={msg_id}（长视频可能需 5-20 分钟）")
+                dl = await right_click_download(page, media, timeout_ms=900000, max_attempts=1)
                 if dl:
                     suggested = dl.suggested_filename or ""
                     sfx = Path(suggested).suffix or ".mp4"
@@ -448,7 +401,6 @@ async def process_message(
                         record["errors"].append("video-save-failed")
                 else:
                     record["errors"].append("video-no-download")
-            # 视频封面截图
             try:
                 thumb = media.locator("canvas.thumbnail, img.thumbnail").first
                 if await thumb.count() > 0 and await thumb.is_visible():
@@ -459,7 +411,6 @@ async def process_message(
             except Exception as e:
                 record["errors"].append(f"video-thumb: {e}")
 
-    # 4) 网页预览的图片：截图保存
     if msg_data.get("hasWebPage"):
         record["kinds"].append("webpage")
         try:
@@ -472,19 +423,12 @@ async def process_message(
         except Exception as e:
             record["errors"].append(f"webpage: {e}")
 
-    # 标记纯文本
     if not record["kinds"]:
         record["kinds"].append("text-only")
-
     return record
 
 
-# ---------------- 滚动加载历史 ----------------
-
 async def scroll_up_and_wait(page: Page, prev_first_id: Optional[str], max_wait_ms: int = 6000) -> tuple[bool, Optional[str]]:
-    """
-    向上滚动一次，等待 first visible msg id 变化。返回 (是否加载到新消息, 新 first id)。
-    """
     js = """
     () => {
       const ml = document.querySelector('.Transition_slide-active div.Transition.MessageList');
@@ -494,35 +438,25 @@ async def scroll_up_and_wait(page: Page, prev_first_id: Optional[str], max_wait_
     }
     """
     await page.evaluate(js)
-    # 轮询直到 first id 变化或超时
     deadline = asyncio.get_event_loop().time() + max_wait_ms / 1000
     new_first = prev_first_id
     while asyncio.get_event_loop().time() < deadline:
         await page.wait_for_timeout(400)
-        cur = await page.evaluate(
-            "() => document.querySelector('.Transition_slide-active .message-list-item[data-message-id]')?.getAttribute('data-message-id') || null"
-        )
+        cur = await page.evaluate("() => document.querySelector('.Transition_slide-active .message-list-item[data-message-id]')?.getAttribute('data-message-id') || null")
         if cur and cur != prev_first_id:
             new_first = cur
             return True, new_first
     return False, new_first
 
 
-# ---------------- 主流程 ----------------
-
 async def open_target_channel(page: Page, target_hash: str) -> bool:
-    """
-    打开 https://web.telegram.org/a/ ，在 sidebar 中点击匹配 target_hash 的会话。
-    """
     log(f"打开 Telegram Web，定位频道 {target_hash} ...")
     await page.goto("https://web.telegram.org/a/", wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(3000)
-    # 等待 chat-list 出现
     try:
         await page.wait_for_selector(f"a[href='{target_hash}']", timeout=15000)
     except PlaywrightTimeoutError:
         log("sidebar 中未找到目标会话链接，尝试直接 hash 跳转")
-    # 优先 sidebar 点击
     link = page.locator(f"a[href='{target_hash}']").first
     if await link.count() > 0:
         try:
@@ -530,21 +464,14 @@ async def open_target_channel(page: Page, target_hash: str) -> bool:
             await page.wait_for_timeout(2000)
         except Exception as e:
             log(f"sidebar 点击失败: {e}")
-    # 兜底：location.hash
     if target_hash not in (await page.evaluate("() => location.hash")):
         await page.evaluate(f"() => location.hash = '{target_hash}'")
         await page.wait_for_timeout(2000)
-    # 等待 message list 出现
     try:
         await page.locator(MESSAGE_LIST).first.wait_for(state="visible", timeout=20000)
-    except PlaywrightTimeoutError:
-        log("消息列表未加载")
-        return False
-    # 等至少 1 个 date group
-    try:
         await page.locator(f"{MESSAGE_LIST} {DATE_GROUP}").first.wait_for(state="attached", timeout=20000)
     except PlaywrightTimeoutError:
-        log("未等到 date group")
+        log("消息列表或 date group 未加载")
         return False
     log(f"频道打开成功：{await page.title()}")
     return True
@@ -572,85 +499,53 @@ async def run(args) -> None:
             if not ok:
                 log("打开目标频道失败，退出")
                 return
-
             channel_title = await page.title()
-            channel_slug = slugify(channel_title)
-            out_dir = out_base / channel_slug
+            out_dir = out_base / slugify(channel_title)
             out_dir.mkdir(parents=True, exist_ok=True)
             manifest_path = out_dir / "manifest.jsonl"
-            summary_path = out_dir / "_channel_summary.txt"
-            summary_path.write_text(
+            (out_dir / "_channel_summary.txt").write_text(
                 f"channel_title={channel_title}\ntarget_hash={target_hash}\nstarted={datetime.now().isoformat()}\n",
                 encoding="utf-8",
             )
             log(f"输出目录：{out_dir}")
-
             processed_ids: set[str] = set()
-            global_sg_seq = 0  # 全局 sender-group 序号
-            prev_first_id: Optional[str] = None
+            global_sg_seq = 0
             no_change_rounds = 0
-
             with manifest_path.open("a", encoding="utf-8") as manifest_fp:
                 for round_idx in range(args.scroll_max):
-                    # 抽取当前 DOM
                     data = await page.evaluate(EXTRACT_MESSAGES_JS)
                     if not data.get("containerFound"):
                         log("DOM 中没有 date-group，等待 …")
                         await page.wait_for_timeout(1000)
                         continue
-
                     first_id = data.get("firstVisibleId")
-                    last_id = data.get("lastVisibleId")
-                    log(
-                        f"round={round_idx} groups={len(data['dateGroups'])} "
-                        f"first={first_id} last={last_id}"
-                    )
-
-                    # 遍历 date group → sender-group → 消息
-                    current_sg: list[dict] = []  # 累积 sender-group 内的消息
-
+                    log(f"round={round_idx} groups={len(data['dateGroups'])} first={first_id} last={data.get('lastVisibleId')}")
+                    current_sg: list[dict] = []
                     for dg in data["dateGroups"]:
                         date_text = dg.get("dateText", "")
                         yyyymmdd = date_to_yyyymmdd(date_text)
                         for msg in dg["items"]:
-                            msg_id = msg["id"]
-                            # 新组开始
                             if msg.get("isFirstInGroup"):
                                 current_sg = []
                             current_sg.append({"msg": msg, "yyyymmdd": yyyymmdd, "date_text": date_text})
-                            # 组结束 → 处理
                             if msg.get("isLastInGroup"):
-                                # start_msg_id 过滤：如果整组的所有 msg_id 都 > start_msg_id 则跳过
                                 sg_min_id = min(int(s["msg"]["id"]) for s in current_sg if s["msg"]["id"].isdigit())
                                 if start_msg_id is None or sg_min_id <= start_msg_id:
-                                    await process_sender_group(
-                                        page, current_sg, out_dir, manifest_fp,
-                                        global_sg_seq, processed_ids, args.skip_existing, args.dry_run,
-                                        only_kinds, skip_kinds,
-                                    )
+                                    await process_sender_group(page, current_sg, out_dir, manifest_fp, global_sg_seq, processed_ids, args.skip_existing, args.dry_run, only_kinds, skip_kinds)
                                 global_sg_seq += 1
                                 current_sg = []
-
                             if args.max_groups is not None and global_sg_seq >= args.max_groups:
                                 break
                         if args.max_groups is not None and global_sg_seq >= args.max_groups:
                             break
-
                     if args.max_groups is not None and global_sg_seq >= args.max_groups:
                         log(f"达到 max-groups={args.max_groups}，停止")
                         break
-
-                    # 滚动加载更多
-                    changed, new_first = await scroll_up_and_wait(page, first_id)
-                    if not changed:
-                        no_change_rounds += 1
-                        if no_change_rounds >= 3:
-                            log("连续多轮无新消息加载，应该已到顶")
-                            break
-                    else:
-                        no_change_rounds = 0
-                    prev_first_id = new_first
-
+                    changed, _ = await scroll_up_and_wait(page, first_id)
+                    no_change_rounds = 0 if changed else no_change_rounds + 1
+                    if no_change_rounds >= 3:
+                        log("连续多轮无新消息加载，应该已到顶")
+                        break
             log(f"完成。共处理 sender-group={global_sg_seq}，msg={len(processed_ids)}")
         finally:
             try:
@@ -659,26 +554,14 @@ async def run(args) -> None:
                 pass
 
 
-async def process_sender_group(
-    page: Page,
-    sg_msgs: list[dict],
-    out_dir: Path,
-    manifest_fp,
-    sg_seq: int,
-    processed_ids: set[str],
-    skip_existing: bool,
-    dry_run: bool,
-    only_kinds: Optional[set[str]] = None,
-    skip_kinds: Optional[set[str]] = None,
-) -> None:
+async def process_sender_group(page: Page, sg_msgs: list[dict], out_dir: Path, manifest_fp, sg_seq: int, processed_ids: set[str], skip_existing: bool, dry_run: bool, only_kinds: Optional[set[str]] = None, skip_kinds: Optional[set[str]] = None) -> None:
     if not sg_msgs:
         return
     first = sg_msgs[0]
     first_msg_id = first["msg"]["id"]
     if first_msg_id in processed_ids:
         return
-    yyyymmdd = first["yyyymmdd"]
-    group_dir = out_dir / safe_filename(f"group_{yyyymmdd}_{sg_seq:04d}__{first_msg_id}")
+    group_dir = out_dir / safe_filename(f"group_{first['yyyymmdd']}_{sg_seq:04d}__{first_msg_id}")
     log(f"sender-group seq={sg_seq} date={first['date_text']} first_msg={first_msg_id} -> {group_dir.name}")
     if dry_run:
         for s in sg_msgs:
@@ -690,18 +573,10 @@ async def process_sender_group(
             if s["msg"].get("hasMediaInner") and not s["msg"].get("hasAlbum"): kinds.append("video")
             if s["msg"].get("hasWebPage"): kinds.append("webpage")
             if not kinds: kinds.append("text-only")
-            manifest_fp.write(json.dumps({
-                "ts": datetime.now().isoformat(),
-                "sg_seq": sg_seq,
-                "msg_id": s["msg"]["id"],
-                "dry_run": True,
-                "kinds": kinds,
-                "text_len": len(s["msg"].get("text") or ""),
-            }, ensure_ascii=False) + "\n")
+            manifest_fp.write(json.dumps({"ts": datetime.now().isoformat(), "sg_seq": sg_seq, "msg_id": s["msg"]["id"], "dry_run": True, "kinds": kinds, "text_len": len(s["msg"].get("text") or "")}, ensure_ascii=False) + "\n")
         manifest_fp.flush()
         return
     group_dir.mkdir(parents=True, exist_ok=True)
-    # 组合 _combined.txt 记录所有消息的纯文本顺序
     combined_lines: list[str] = []
     for s in sg_msgs:
         msg = s["msg"]
@@ -713,15 +588,11 @@ async def process_sender_group(
             log(f"  消息 {msg_id} 不在 DOM 中，跳过")
             continue
         record = await process_message(page, msg, loc, group_dir, manifest_fp, skip_existing, only_kinds, skip_kinds)
-        record["sg_seq"] = sg_seq
-        record["date"] = s["date_text"]
-        record["yyyymmdd"] = yyyymmdd
-        record["ts"] = datetime.now().isoformat()
+        record.update({"sg_seq": sg_seq, "date": s["date_text"], "yyyymmdd": s["yyyymmdd"], "ts": datetime.now().isoformat()})
         manifest_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
         manifest_fp.flush()
         processed_ids.add(msg_id)
-        text = msg.get("text") or ""
-        combined_lines.append(f"## msg {msg_id}  ({'+'.join(record['kinds'])})\n{text}\n")
+        combined_lines.append(f"## msg {msg_id}  ({'+'.join(record['kinds'])})\n{msg.get('text') or ''}\n")
     if combined_lines:
         (group_dir / "_combined.md").write_text("\n".join(combined_lines), encoding="utf-8")
 
