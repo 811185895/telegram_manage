@@ -214,7 +214,7 @@ async def right_click_download(
     page: Page,
     locator: Locator,
     timeout_ms: int = 90000,
-    max_attempts: int = 3,
+    max_attempts: int = 2,
 ) -> Optional[Download]:
     """
     在元素上右键，等待菜单出现，找 Download 项，再用 expect_download 包裹点击。
@@ -258,29 +258,6 @@ async def right_click_download(
             await menu_item_any.wait_for(state="visible", timeout=4000)
         except PlaywrightTimeoutError:
             log(f"  右键菜单未出现 (attempt {attempt+1})")
-            # debug 输出当前状态
-            try:
-                dbg = await page.evaluate(
-                    """() => ({
-                        url: location.href,
-                        title: document.title,
-                        visible: document.visibilityState,
-                        focused: document.hasFocus(),
-                        ctxRootCount: document.querySelectorAll('.Menu.MessageContextMenu').length,
-                        allMenuCount: document.querySelectorAll('.Menu').length,
-                        allMenuItemCount: document.querySelectorAll('.MenuItem').length,
-                        bodyChildren: document.body.children.length,
-                    })"""
-                )
-                log(f"    debug: {dbg}")
-            except Exception as e:
-                log(f"    debug 失败: {e}")
-            try:
-                shot_path = Path("./debug_rclick_fail.png").resolve()
-                await page.screenshot(path=str(shot_path))
-                log(f"    screenshot: {shot_path}")
-            except Exception:
-                pass
             continue
         # 找 Download 项
         download_item = page.locator(f"{CONTEXT_MENU_ITEM}:has-text('Download')").first
@@ -458,8 +435,8 @@ async def process_message(
         if kind_enabled("video"):
             media = msg_locator.locator(MEDIA_INNER).first
             if await media.count() > 0:
-                log(f"  → video msg={msg_id}")
-                dl = await right_click_download(page, media, timeout_ms=180000)
+                log(f"  → video msg={msg_id}（长视频可能需 5-20 分钟）")
+                dl = await right_click_download(page, media, timeout_ms=900000, max_attempts=1)
                 if dl:
                     suggested = dl.suggested_filename or ""
                     sfx = Path(suggested).suffix or ".mp4"
