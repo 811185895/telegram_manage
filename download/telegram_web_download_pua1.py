@@ -72,7 +72,9 @@ TEXT_CONTENT = ".text-content"
 WEBPAGE = ".WebPage"
 COMMENT_BUTTON = ".CommentButton"
 
-CONTEXT_MENU_ITEM = "div.Menu .MenuItem, .bubble .MenuItem"
+CONTEXT_MENU_ROOT = ".Menu.MessageContextMenu"
+# 等待菜单出现时用 .MenuItem 而非 root（root 是 0x0 的 portal 容器）
+CONTEXT_MENU_ITEM = f"{CONTEXT_MENU_ROOT} .MenuItem"
 
 
 def log(msg: str) -> None:
@@ -195,53 +197,111 @@ EXTRACT_MESSAGES_JS = """
 # ---------------- 工具：右键下载 ----------------
 
 
+async def _close_any_open_menu(page: Page) -> None:
+    """关闭任何已开的 context menu。"""
+    try:
+        cnt = await page.locator(CONTEXT_MENU_ROOT).count()
+        if cnt > 0:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(150)
+            await page.mouse.click(5, 5)
+            await page.wait_for_timeout(100)
+    except Exception:
+        pass
+
+
 async def right_click_download(
     page: Page,
     locator: Locator,
     timeout_ms: int = 90000,
+    max_attempts: int = 3,
 ) -> Optional[Download]:
     """
     在元素上右键，等待菜单出现，找 Download 项，再用 expect_download 包裹点击。
     若菜单没有 Download 项则按 Esc 关闭并返回 None。
     """
-    try:
-        await locator.scroll_into_view_if_needed()
-    except Exception:
-        pass
-    await page.wait_for_timeout(150)
-    try:
-        await locator.click(button="right")
-    except Exception as e:
-        log(f"  右键失败: {e}")
-        return None
-    # 等菜单出现
-    menu = page.locator(CONTEXT_MENU_ITEM)
-    try:
-        await menu.first.wait_for(state="visible", timeout=2000)
-    except PlaywrightTimeoutError:
-        log("  右键菜单未出现")
-        return None
-    # 找 Download 项
-    download_item = page.locator(f"{CONTEXT_MENU_ITEM}:has-text('Download')").first
-    try:
-        if not await download_item.is_visible():
-            await page.keyboard.press("Escape")
-            return None
-    except Exception:
-        await page.keyboard.press("Escape")
-        return None
-    # 用 expect_download 包裹点击
-    try:
-        async with page.expect_download(timeout=timeout_ms) as di:
-            await download_item.click()
-        return await di.value
-    except Exception as e:
-        log(f"  下载等待失败: {e}")
+    for attempt in range(max_attempts):
+        await _close_any_open_menu(page)
         try:
-            await page.keyboard.press("Escape")
+            await page.bring_to_front()
         except Exception:
             pass
-        return None
+        try:
+            await locator.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(500)
+        # 直接用 JS 派发 contextmenu 事件，让 React 接收（最稳）
+        try:
+            await locator.evaluate(
+                """el => {
+                    const r = el.getBoundingClientRect();
+                    const x = r.left + r.width/2, y = r.top + r.height/2;
+                    const opts = { bubbles: true, cancelable: true, view: window,
+                                   button: 2, buttons: 2, clientX: x, clientY: y };
+                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                    el.dispatchEvent(new MouseEvent('mouseup', opts));
+                    el.dispatchEvent(new MouseEvent('contextmenu', opts));
+                }"""
+            )
+        except Exception as e:
+            log(f"  JS 派发 contextmenu 失败 (attempt {attempt+1}): {e}")
+            # 兜底：playwright 物理右键
+            try:
+                await locator.click(button="right", force=True, timeout=5000)
+            except Exception as e2:
+                log(f"  物理右键也失败: {e2}")
+                continue
+        # 等菜单出现（用 .MenuItem 而非 .Menu，因为 root 是 0x0 portal 容器）
+        menu_item_any = page.locator(CONTEXT_MENU_ITEM).first
+        try:
+            await menu_item_any.wait_for(state="visible", timeout=4000)
+        except PlaywrightTimeoutError:
+            log(f"  右键菜单未出现 (attempt {attempt+1})")
+            # debug 输出当前状态
+            try:
+                dbg = await page.evaluate(
+                    """() => ({
+                        url: location.href,
+                        title: document.title,
+                        visible: document.visibilityState,
+                        focused: document.hasFocus(),
+                        ctxRootCount: document.querySelectorAll('.Menu.MessageContextMenu').length,
+                        allMenuCount: document.querySelectorAll('.Menu').length,
+                        allMenuItemCount: document.querySelectorAll('.MenuItem').length,
+                        bodyChildren: document.body.children.length,
+                    })"""
+                )
+                log(f"    debug: {dbg}")
+            except Exception as e:
+                log(f"    debug 失败: {e}")
+            try:
+                shot_path = Path("./debug_rclick_fail.png").resolve()
+                await page.screenshot(path=str(shot_path))
+                log(f"    screenshot: {shot_path}")
+            except Exception:
+                pass
+            continue
+        # 找 Download 项
+        download_item = page.locator(f"{CONTEXT_MENU_ITEM}:has-text('Download')").first
+        try:
+            if not await download_item.is_visible():
+                await _close_any_open_menu(page)
+                log("  菜单中无 Download 项")
+                return None
+        except Exception:
+            await _close_any_open_menu(page)
+            return None
+        # 用 expect_download 包裹点击
+        try:
+            async with page.expect_download(timeout=timeout_ms) as di:
+                await download_item.click()
+            return await di.value
+        except Exception as e:
+            log(f"  下载等待失败 (attempt {attempt+1}): {e}")
+            await _close_any_open_menu(page)
+            continue
+    return None
 
 
 async def save_download(download: Download, dest: Path) -> Optional[Path]:

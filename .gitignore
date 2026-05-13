@@ -10,6 +10,7 @@ __pycache__/
 # Runtime/downloaded Telegram data
 download/output/
 download/pua1/
+download/debug_*.png
 
 # Large or sensitive DOM/media captures used during manual debugging
 download/resources/
