@@ -5,6 +5,7 @@ __pycache__/
 # Local editor state
 .vscode/
 .playwright-mcp/
+.github_browser_profile/
 
 # Runtime/downloaded Telegram data
 download/output/

@@ -1,600 +1,716 @@
 """
-Telegram Web 频道消息与媒体下载脚本 (Playwright)
+Telegram Web 频道消息与媒体采集（Playwright）
 
-先打开入口页 -5132543141，若有「Go to bottom」则点一下，
-再点击最后一个 group 的最后一个 message 的右箭头跳转到目标频道 -1001395144198，
-在消息列表中滚动加载更多，按日期组解析消息，
-将文件/视频/图片/图文集/评论等保存到 output/pua1/group_yyyymmdd_N 目录。
+目标：把目标频道里每条消息的全量文本、堆叠的图片/文档/视频都采集下来，
+按"发送方组"（sender-group: first-in-group / last-in-group 标记的连续消息）划分输出目录。
 
-用法:
-  1. 安装: pip install -r requirements.txt && playwright install chromium
-  2. 运行: python telegram_web_download_pua1.py [--max-groups N] [--scroll-times N]
-  3. 首次需在浏览器中登录 Telegram Web，脚本会打开频道并开始抓取。
+运行步骤：
+  1. pip install -r requirements.txt && playwright install chromium
+  2. 先用 Chromium 打开 https://web.telegram.org 登录 Telegram（持久化 profile）。
+     默认 profile：D:\\UserData\\.playwright_user_data--claude
+     如果该 profile 已被另一个 Chromium 占用（例如 playwright MCP），请先关闭它。
+  3. 运行：python telegram_web_download_pua1.py [--target #-1001395144198] [--max-groups N]
 
-命令行参数:
-  --max-groups N    最多处理的日期组数量（例: --max-groups 2 只处理前 2 组）
-  --scroll-times N  向上滚动加载更多消息的次数（默认 5）
-
-# 只处理前 2 个日期组，滚动 3 次加载
-python telegram_web_download_pua1.py --max-groups 2 --scroll-times 3
-# 处理全部组，但只滚动 10 次
-python telegram_web_download_pua1.py --scroll-times 10
-# 只看前 1 组（快速试跑）
-python telegram_web_download_pua1.py --max-groups 1 --scroll-times 1
-
-
-保存规则:
-  - 组目录: output/pua1/group_{yyyymmdd}_{N}，如 group_20210906_0
-  - 文件: messageid_textpre_file_原文件名
-  - 视频: messageid_textpre_video_{上传时间戳}.mp4，封面 messageid_textpre_video_image.png
-  - 相册子项: messageid_textpre_子id_video_* 或 messageid_子id_textpre_img.png
-  - 文本: messageid_textpre_text.txt（无文本则 textpre=无文本）
-  - 评论: messageid_textpre_comments_评论数.txt，评论内媒体带 cmt_pre、评论 id
+输出目录布局：
+  output/<channel_slug>/
+    group_<yyyymmdd>_<sgseq>__<first_msg_id>/
+      <msg_id>__<text_pre>__text.txt
+      <msg_id>__<text_pre>__raw.html
+      <msg_id>__<text_pre>__video.mp4
+      <msg_id>__<text_pre>__video_thumb.png
+      <msg_id>__<text_pre>__file_<原名>
+      <msg_id>__<text_pre>__photo.png
+      <msg_id>__<text_pre>__album_<sub_id>__video.mp4
+      <msg_id>__<text_pre>__album_<sub_id>__photo.png
+    manifest.jsonl     （逐条消息的处理记录）
+    _channel_summary.txt （频道信息）
 """
+from __future__ import annotations
+
 import argparse
 import asyncio
+import json
 import re
 import shutil
 import sys
-from pathlib import Path
 from datetime import datetime
-from typing import Optional
-# 项目根目录
-project_root = Path(r"D:\code\myNovels")
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-from app.长篇自动发布.app.edge_util import get_page
+from pathlib import Path
+from typing import Any, Optional
 
-from playwright.async_api import Page, Download, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    Download,
+    ElementHandle,
+    Locator,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
-# 脚本所在目录
 SCRIPT_DIR = Path(__file__).resolve().parent
-# 保存根目录：output/pua1
-OUT_BASE = SCRIPT_DIR / "output" / "pua1"
-# 浏览器默认下载目录（右键 Download 会落在这里）
-DOWNLOAD_DIR = Path(r"D:\Download")
-# 持久化用户数据目录（与 create_book_起点.py 一致，可用同一目录或单独目录）
-USER_DATA_DIR = Path(r"D:\UserData\.playwright_user_data")
 
-# 入口页：从此页点击「最后一个 group 的最后一个 message 的右箭头」跳转到目标频道
-ENTRY_URL = "https://web.telegram.org/a/#-5132543141"
-TARGET_URL = "https://web.telegram.org/a/#-1001395144198"
-# Go to bottom 按钮（入口页若有则点一下）
-GO_TO_BOTTOM_SELECTOR = 'button[aria-label="Go to bottom"], button[title="Go to bottom"]'
-# 最后一个 group 的最后一个 message 的右箭头（Focus message）
-# 最后一个 message 的右箭头：排除 sticky 区，只匹配带 Focus message 的按钮（download_flag.html 1765-1772）
-LAST_MESSAGE_RIGHT_ARROW_SELECTOR = '.message-action-buttons:not(.message-action-button-sticky) button[aria-label="Focus message"]'
-# MessageList 根：不写死 class 组合，只要内部有 .messages-container 即可（参考 groups查找方案.md）
-# 限定在 Transition_slide-active 下，避免选到隐藏的 slide
-MESSAGE_LIST_ROOT_SELECTOR = ".Transition_slide-active div.Transition.MessageList:has(div.messages-container)"
-MESSAGE_LIST_SELECTOR = f"{MESSAGE_LIST_ROOT_SELECTOR} div.messages-container"
-# 日期组（pua1.html 5587/5599 等 .message-date-group）
-DATE_GROUP_SELECTOR = ".message-date-group"
-# 组内时间戳（sticky-date 内 span 文本，如 "September 6, 2021"）
-STICKY_DATE_SELECTOR = ".sticky-date span"
-# 组内消息（含 message-group 下的 message）
-MESSAGE_ITEM_SELECTOR = ".message-date-group div.message-list-item[data-message-id]"
-# 文件消息：.message-content.document 或 .File
-FILE_MESSAGE_SELECTOR = ".message-content.document .File, .message-content .File.interactive"
-FILE_TITLE_SELECTOR = ".file-title"
-# 视频消息：.message-content.media .media-inner video
-VIDEO_MESSAGE_SELECTOR = ".message-content.media .media-inner"
-VIDEO_TAG_SELECTOR = "video.full-media"
-THUMBNAIL_SELECTOR = "img.thumbnail"
-# 图文集（相册）
-ALBUM_SELECTOR = ".Album"
-ALBUM_ITEM_SELECTOR = "[id^='album-media-message-']"
-# 文本内容（排除 MessageMeta）
-TEXT_CONTENT_SELECTOR = ".text-content.with-meta, .text-content"
-MESSAGE_META_SELECTOR = ".MessageMeta"
-# 评论按钮
-COMMENT_BUTTON_SELECTOR = ".CommentButton"
-# 右键菜单 Download
-CONTEXT_MENU_DOWNLOAD_SELECTOR = 'div.MenuItem:has-text("Download")'
+# -------- 默认参数 --------
+DEFAULT_USER_DATA_DIR = Path(r"D:\UserData\.playwright_user_data--claude")
+DEFAULT_OUT_BASE = SCRIPT_DIR / "output"
+DEFAULT_DOWNLOAD_DIR = Path(r"D:\Download")
+DEFAULT_TARGET = "#-1001395144198"  # 恋爱心理学 追爱脱单 视频教程
+
+# -------- Telegram Web Selectors --------
+MESSAGE_LIST_ROOT = ".Transition_slide-active div.Transition.MessageList:has(div.messages-container)"
+MESSAGE_LIST = f"{MESSAGE_LIST_ROOT} div.messages-container"
+DATE_GROUP = ".message-date-group"
+STICKY_DATE = ".sticky-date span"
+MSG_ITEM = "div.message-list-item[data-message-id]"
+
+FILE_BLOCK = ".File.interactive"
+FILE_TITLE = ".file-title"
+MEDIA_INNER = ".media-inner.interactive"
+THUMBNAIL = "canvas.thumbnail, img.thumbnail"
+FULL_MEDIA_IMG = "img.full-media"
+ALBUM = ".Album"
+ALBUM_ITEM = "[id^='album-media-message-']"
+TEXT_CONTENT = ".text-content"
+WEBPAGE = ".WebPage"
+COMMENT_BUTTON = ".CommentButton"
+
+CONTEXT_MENU_ITEM = "div.Menu .MenuItem, .bubble .MenuItem"
 
 
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
 def safe_filename(s: str, max_len: int = 80) -> str:
-    """替换文件名非法字符，截断长度。"""
     s = (s or "").strip()
     for c in r'\/:*?"<>|':
         s = s.replace(c, "_")
     s = s.replace("\n", " ").replace("\r", "")
+    s = re.sub(r"\s+", " ", s).strip()
     if len(s) > max_len:
-        s = s[:max_len]
+        s = s[:max_len].rstrip()
     return s or "unnamed"
 
 
 def text_preview(text: str, length: int = 30, default_empty: str = "无文本") -> str:
-    """文本前 N 字符，用于命名；无则返回 default_empty（消息用 无文本，评论用 无文字）。"""
-    t = (text or "").strip().replace("\n", " ")
-    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s+", " ", (text or "").strip())
     if not t:
         return default_empty
     return safe_filename(t[:length], length)
 
 
-def date_to_timestamp(date_text: str) -> str:
-    """将 'September 6, 2021' / 'January 17' 等转为 yyyymmdd 格式便于做目录名。"""
+def date_to_yyyymmdd(date_text: str) -> str:
     raw = (date_text or "").strip()
     if not raw:
         return "unknown"
-    try:
-        # 带年份的格式
-        for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%d.%m.%Y", "%B %d,%Y"):
-            try:
-                dt = datetime.strptime(raw, fmt)
-                return dt.strftime("%Y%m%d")
-            except ValueError:
-                continue
-        # 无年份（如 "January 17"）用当前年
-        for fmt in ("%B %d", "%b %d"):
-            try:
-                dt = datetime.strptime(raw, fmt)
-                dt = dt.replace(year=datetime.now().year)
-                return dt.strftime("%Y%m%d")
-            except ValueError:
-                continue
-    except Exception:
-        pass
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%d.%m.%Y", "%B %d,%Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    for fmt in ("%B %d", "%b %d"):
+        try:
+            dt = datetime.strptime(raw, fmt).replace(year=datetime.now().year)
+            return dt.strftime("%Y%m%d")
+        except ValueError:
+            continue
+    # Today / Yesterday / weekday — use current date best-effort
+    lower = raw.lower()
+    if lower == "today":
+        return datetime.now().strftime("%Y%m%d")
     return safe_filename(raw, 20)
 
 
-async def goto_target_via_entry(page: Page) -> bool:
+def slugify(s: str, max_len: int = 60) -> str:
+    s = (s or "channel").strip()
+    s = re.sub(r"[\\/:*?\"<>|\n\r\t]+", "_", s)
+    s = re.sub(r"\s+", "_", s)
+    return s[:max_len] or "channel"
+
+
+# ---------------- DOM 抽取（评估 JS，一次拿全） ----------------
+
+EXTRACT_MESSAGES_JS = """
+() => {
+  const out = { containerFound: false, firstVisibleId: null, lastVisibleId: null, dateGroups: [] };
+  const dateGroups = document.querySelectorAll('.Transition_slide-active .message-date-group');
+  if (!dateGroups.length) return out;
+  out.containerFound = true;
+  for (const dg of dateGroups) {
+    const dateText = dg.querySelector('.sticky-date span')?.innerText || '';
+    const msgs = dg.querySelectorAll('div.message-list-item[data-message-id]');
+    const items = [];
+    msgs.forEach(m => {
+      const id = m.getAttribute('data-message-id');
+      const cls = m.className || '';
+      const contentClass = m.querySelector('.message-content')?.className || '';
+      // 提取文本：clone & remove MessageMeta & WebPage description（avoid mixing link-preview meta into the user text）
+      let text = '';
+      const tc = m.querySelector('.text-content');
+      if (tc) {
+        const clone = tc.cloneNode(true);
+        clone.querySelectorAll('.MessageMeta, .message-time, .message-views').forEach(n => n.remove());
+        text = (clone.innerText || '').trim();
+      }
+      // 文件名
+      let fileName = '';
+      const ft = m.querySelector('.File .file-title');
+      if (ft) fileName = (ft.getAttribute('title') || ft.innerText || '').trim();
+      // 相册子项
+      const albumItems = [];
+      m.querySelectorAll("[id^='album-media-message-']").forEach(it => {
+        const subId = (it.getAttribute('id') || '').replace('album-media-message-','');
+        const hasVideo = !!it.querySelector('video, .media-inner.interactive');
+        const hasImg = !!it.querySelector('img.full-media, img.thumbnail, canvas.thumbnail');
+        albumItems.push({ subId, hasVideo, hasImg });
+      });
+      items.push({
+        id,
+        cls,
+        contentClass,
+        isFirstInGroup: cls.includes('first-in-group'),
+        isLastInGroup: cls.includes('last-in-group'),
+        isActionMessage: cls.includes('ActionMessage'),
+        hasFile: !!m.querySelector('.File.interactive'),
+        fileName,
+        hasMediaInner: !!m.querySelector('.media-inner.interactive'),
+        hasAlbum: albumItems.length > 0,
+        albumItems,
+        hasWebPage: !!m.querySelector('.WebPage'),
+        hasComments: !!m.querySelector('.CommentButton'),
+        text,
+      });
+    });
+    if (items.length) out.dateGroups.push({ dateText, items });
+  }
+  // first / last visible message ids
+  const all = document.querySelectorAll('.Transition_slide-active .message-list-item[data-message-id]');
+  if (all.length) {
+    out.firstVisibleId = all[0].getAttribute('data-message-id');
+    out.lastVisibleId = all[all.length-1].getAttribute('data-message-id');
+  }
+  return out;
+}
+"""
+
+
+# ---------------- 工具：右键下载 ----------------
+
+
+async def right_click_download(
+    page: Page,
+    locator: Locator,
+    timeout_ms: int = 90000,
+) -> Optional[Download]:
     """
-    先打开入口页 ENTRY_URL，若有 Go to bottom 则点一下，
-    再点击最后一个 group 的最后一个 message 的右箭头，跳转到 TARGET_URL，然后执行业务流程。
-    返回是否成功跳转到目标页。
+    在元素上右键，等待菜单出现，找 Download 项，再用 expect_download 包裹点击。
+    若菜单没有 Download 项则按 Esc 关闭并返回 None。
     """
-    log("打开入口页...")
-    await page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2000)
-    # 若有 Go to bottom 按钮则点一下
-    go_btn = page.locator(GO_TO_BOTTOM_SELECTOR).first
     try:
-        if await go_btn.is_visible():
-            await go_btn.click(timeout=1000)
-            log("已点击 Go to bottom")
-            await page.wait_for_timeout(1000)
+        await locator.scroll_into_view_if_needed()
     except Exception:
         pass
-    # 点击最后一个 group 的最后一个 message 的右箭头
-    container = page.locator(MESSAGE_LIST_SELECTOR).first
+    await page.wait_for_timeout(150)
     try:
-        await container.wait_for(state="visible", timeout=2000)
-    except PlaywrightTimeoutError:
-        log("未找到消息列表，尝试直接打开目标页")
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=2000)
-        return True
-    last_group = container.locator(DATE_GROUP_SELECTOR).last
-    if await last_group.count() == 0:
-        log("未找到任何日期组，尝试直接打开目标页")
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
-        return True
-    last_message = last_group.locator("div.message-list-item[data-message-id]").last
-    if await last_message.count() == 0:
-        log("未找到最后一条消息，尝试直接打开目标页")
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
-        return True
-    # 精确定位：只在「最后一个 group 的最后一个 message」内找，且排除空的 sticky 区，只点带 Focus message 的按钮（download_flag.html 1765-1772）
-    right_arrow = last_message.locator(
-        '.message-action-buttons:not(.message-action-button-sticky) button[aria-label="Focus message"]'
-    ).first
-    try:
-        await right_arrow.wait_for(state="visible", timeout=3000)
-        await right_arrow.hover()
-        await page.wait_for_timeout(1000)
-        await right_arrow.click()
-        await page.wait_for_timeout(1000)
-        if "-1001395144198" in page.url:
-            log("已通过右箭头跳转到目标频道")
-            return True
+        await locator.click(button="right")
     except Exception as e:
-        log(f"点击右箭头失败: {e}")
-    log("尝试直接打开目标页")
-    await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+        log(f"  右键失败: {e}")
+        return None
+    # 等菜单出现
+    menu = page.locator(CONTEXT_MENU_ITEM)
+    try:
+        await menu.first.wait_for(state="visible", timeout=2000)
+    except PlaywrightTimeoutError:
+        log("  右键菜单未出现")
+        return None
+    # 找 Download 项
+    download_item = page.locator(f"{CONTEXT_MENU_ITEM}:has-text('Download')").first
+    try:
+        if not await download_item.is_visible():
+            await page.keyboard.press("Escape")
+            return None
+    except Exception:
+        await page.keyboard.press("Escape")
+        return None
+    # 用 expect_download 包裹点击
+    try:
+        async with page.expect_download(timeout=timeout_ms) as di:
+            await download_item.click()
+        return await di.value
+    except Exception as e:
+        log(f"  下载等待失败: {e}")
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return None
+
+
+async def save_download(download: Download, dest: Path) -> Optional[Path]:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        await download.save_as(str(dest))
+        return dest if dest.exists() else None
+    except Exception as e:
+        log(f"  save_as 失败: {e}")
+        try:
+            src = await download.path()
+            if src and Path(src).exists():
+                shutil.copy2(str(src), str(dest))
+                return dest
+        except Exception:
+            pass
+        return None
+
+
+# ---------------- 单条消息处理 ----------------
+
+
+async def process_message(
+    page: Page,
+    msg_data: dict,
+    msg_locator: Locator,
+    group_dir: Path,
+    manifest_fp,
+    skip_existing: bool,
+    only_kinds: Optional[set[str]] = None,
+    skip_kinds: Optional[set[str]] = None,
+) -> dict:
+    """
+    msg_data 是 JS 抽取出来的字典，msg_locator 是页面定位器。返回处理结果记录。
+    """
+    msg_id = msg_data["id"]
+    text = msg_data.get("text", "") or ""
+    text_pre = text_preview(text, 30)
+    base = f"{msg_id}__{text_pre}"
+    record: dict[str, Any] = {
+        "msg_id": msg_id,
+        "text_pre": text_pre,
+        "kinds": [],
+        "saved": [],
+        "errors": [],
+        "skipped": False,
+    }
+
+    if msg_data.get("isActionMessage"):
+        record["kinds"].append("action")
+        return record
+
+    # 检查跳过：组目录里已经有 msg_id__ 开头的非 text/html 文件 → 媒体已下载，仍重写文本
+    existing_media = list(group_dir.glob(f"{msg_id}__*")) if group_dir.exists() else []
+    has_media_files = any(
+        not (p.name.endswith("__text.txt") or p.name.endswith("__raw.html"))
+        for p in existing_media
+    )
+
+    # 保存原始 HTML（重型证据）
+    raw_html_path = group_dir / safe_filename(f"{base}__raw.html")
+    if not raw_html_path.exists():
+        try:
+            html = await msg_locator.evaluate("el => el.outerHTML")
+            group_dir.mkdir(parents=True, exist_ok=True)
+            raw_html_path.write_text(html or "", encoding="utf-8")
+        except Exception as e:
+            record["errors"].append(f"raw.html: {e}")
+
+    # 保存文本
+    text_path = group_dir / safe_filename(f"{base}__text.txt")
+    try:
+        group_dir.mkdir(parents=True, exist_ok=True)
+        text_path.write_text(text, encoding="utf-8")
+    except Exception as e:
+        record["errors"].append(f"text.txt: {e}")
+
+    # 媒体已存且 skip_existing → 跳过媒体下载
+    if skip_existing and has_media_files:
+        record["skipped"] = True
+        record["kinds"].append("media-skipped")
+        return record
+
+    def kind_enabled(k: str) -> bool:
+        if only_kinds is not None and k not in only_kinds:
+            return False
+        if skip_kinds is not None and k in skip_kinds:
+            return False
+        return True
+
+    # 1) 文件
+    if msg_data.get("hasFile"):
+        record["kinds"].append("file")
+        if kind_enabled("file"):
+            file_block = msg_locator.locator(FILE_BLOCK).first
+            if await file_block.count() > 0:
+                original = msg_data.get("fileName") or "file"
+                ext = Path(original).suffix
+                stem = Path(original).stem
+                dest = group_dir / safe_filename(f"{base}__file_{stem}{ext}", 120)
+                log(f"  → file: {original}")
+                dl = await right_click_download(page, file_block, timeout_ms=120000)
+                if dl:
+                    saved = await save_download(dl, dest)
+                    if saved:
+                        record["saved"].append(saved.name)
+                    else:
+                        record["errors"].append("file-save-failed")
+                else:
+                    record["errors"].append("file-no-download")
+
+    # 2) 相册
+    if msg_data.get("hasAlbum"):
+        record["kinds"].append("album")
+        if kind_enabled("album"):
+            items = msg_data.get("albumItems") or []
+            for ai in items:
+                sub_id = ai.get("subId") or "x"
+                item_loc = msg_locator.locator(f"#album-media-message-{sub_id}")
+                if await item_loc.count() == 0:
+                    continue
+                try:
+                    await item_loc.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                if ai.get("hasVideo"):
+                    dest = group_dir / safe_filename(f"{base}__album_{sub_id}__video.mp4")
+                    log(f"  → album video sub={sub_id}")
+                    dl = await right_click_download(page, item_loc, timeout_ms=120000)
+                    if dl:
+                        suggested = dl.suggested_filename or ""
+                        sfx = Path(suggested).suffix or ".mp4"
+                        dest = group_dir / safe_filename(f"{base}__album_{sub_id}__video{sfx}")
+                        saved = await save_download(dl, dest)
+                        if saved:
+                            record["saved"].append(saved.name)
+                    else:
+                        record["errors"].append(f"album-video-{sub_id}-no-download")
+                # 截图缩略图作为图片
+                try:
+                    thumb = item_loc.locator("img.full-media, img.thumbnail, canvas.thumbnail").first
+                    if await thumb.count() > 0 and await thumb.is_visible():
+                        img_dest = group_dir / safe_filename(f"{base}__album_{sub_id}__photo.png")
+                        if not img_dest.exists():
+                            group_dir.mkdir(parents=True, exist_ok=True)
+                            await thumb.screenshot(path=str(img_dest))
+                            record["saved"].append(img_dest.name)
+                except Exception as e:
+                    record["errors"].append(f"album-photo-{sub_id}: {e}")
+
+    # 3) 单条视频 / media（非相册）
+    if msg_data.get("hasMediaInner") and not msg_data.get("hasAlbum") and not msg_data.get("hasWebPage"):
+        record["kinds"].append("video")
+        if kind_enabled("video"):
+            media = msg_locator.locator(MEDIA_INNER).first
+            if await media.count() > 0:
+                log(f"  → video msg={msg_id}")
+                dl = await right_click_download(page, media, timeout_ms=180000)
+                if dl:
+                    suggested = dl.suggested_filename or ""
+                    sfx = Path(suggested).suffix or ".mp4"
+                    dest = group_dir / safe_filename(f"{base}__video{sfx}")
+                    saved = await save_download(dl, dest)
+                    if saved:
+                        record["saved"].append(saved.name)
+                    else:
+                        record["errors"].append("video-save-failed")
+                else:
+                    record["errors"].append("video-no-download")
+            # 视频封面截图
+            try:
+                thumb = media.locator("canvas.thumbnail, img.thumbnail").first
+                if await thumb.count() > 0 and await thumb.is_visible():
+                    img_dest = group_dir / safe_filename(f"{base}__video_thumb.png")
+                    if not img_dest.exists():
+                        await thumb.screenshot(path=str(img_dest))
+                        record["saved"].append(img_dest.name)
+            except Exception as e:
+                record["errors"].append(f"video-thumb: {e}")
+
+    # 4) 网页预览的图片：截图保存
+    if msg_data.get("hasWebPage"):
+        record["kinds"].append("webpage")
+        try:
+            preview = msg_locator.locator(f"{WEBPAGE} .media-inner").first
+            if await preview.count() > 0 and await preview.is_visible():
+                img_dest = group_dir / safe_filename(f"{base}__webpage_preview.png")
+                if not img_dest.exists():
+                    await preview.screenshot(path=str(img_dest))
+                    record["saved"].append(img_dest.name)
+        except Exception as e:
+            record["errors"].append(f"webpage: {e}")
+
+    # 标记纯文本
+    if not record["kinds"]:
+        record["kinds"].append("text-only")
+
+    return record
+
+
+# ---------------- 滚动加载历史 ----------------
+
+async def scroll_up_and_wait(page: Page, prev_first_id: Optional[str], max_wait_ms: int = 6000) -> tuple[bool, Optional[str]]:
+    """
+    向上滚动一次，等待 first visible msg id 变化。返回 (是否加载到新消息, 新 first id)。
+    """
+    js = """
+    () => {
+      const ml = document.querySelector('.Transition_slide-active div.Transition.MessageList');
+      if (!ml) return null;
+      ml.scrollTop = 0;
+      return { st: ml.scrollTop, sh: ml.scrollHeight };
+    }
+    """
+    await page.evaluate(js)
+    # 轮询直到 first id 变化或超时
+    deadline = asyncio.get_event_loop().time() + max_wait_ms / 1000
+    new_first = prev_first_id
+    while asyncio.get_event_loop().time() < deadline:
+        await page.wait_for_timeout(400)
+        cur = await page.evaluate(
+            "() => document.querySelector('.Transition_slide-active .message-list-item[data-message-id]')?.getAttribute('data-message-id') || null"
+        )
+        if cur and cur != prev_first_id:
+            new_first = cur
+            return True, new_first
+    return False, new_first
+
+
+# ---------------- 主流程 ----------------
+
+async def open_target_channel(page: Page, target_hash: str) -> bool:
+    """
+    打开 https://web.telegram.org/a/ ，在 sidebar 中点击匹配 target_hash 的会话。
+    """
+    log(f"打开 Telegram Web，定位频道 {target_hash} ...")
+    await page.goto("https://web.telegram.org/a/", wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(3000)
+    # 等待 chat-list 出现
+    try:
+        await page.wait_for_selector(f"a[href='{target_hash}']", timeout=15000)
+    except PlaywrightTimeoutError:
+        log("sidebar 中未找到目标会话链接，尝试直接 hash 跳转")
+    # 优先 sidebar 点击
+    link = page.locator(f"a[href='{target_hash}']").first
+    if await link.count() > 0:
+        try:
+            await link.click()
+            await page.wait_for_timeout(2000)
+        except Exception as e:
+            log(f"sidebar 点击失败: {e}")
+    # 兜底：location.hash
+    if target_hash not in (await page.evaluate("() => location.hash")):
+        await page.evaluate(f"() => location.hash = '{target_hash}'")
+        await page.wait_for_timeout(2000)
+    # 等待 message list 出现
+    try:
+        await page.locator(MESSAGE_LIST).first.wait_for(state="visible", timeout=20000)
+    except PlaywrightTimeoutError:
+        log("消息列表未加载")
+        return False
+    # 等至少 1 个 date group
+    try:
+        await page.locator(f"{MESSAGE_LIST} {DATE_GROUP}").first.wait_for(state="attached", timeout=20000)
+    except PlaywrightTimeoutError:
+        log("未等到 date group")
+        return False
+    log(f"频道打开成功：{await page.title()}")
     return True
 
 
-async def scroll_once_to_load_more(page: Page, scroll_container_selector: str):
-    """在消息列表内向上滚动一次以加载更多历史消息。"""
-    container = page.locator(scroll_container_selector).first
-    await container.evaluate("el => el.scrollTo(0, 0)")
-    await page.wait_for_timeout(500)
-    await container.evaluate("el => el.scrollBy(0, -800)")
-    await page.wait_for_timeout(1200)
+async def run(args) -> None:
+    target_hash = args.target
+    out_base = Path(args.out_base)
+    user_data_dir = Path(args.user_data_dir)
+    only_kinds = set(s.strip() for s in (args.only_kinds or "").split(",") if s.strip()) or None
+    skip_kinds = set(s.strip() for s in (args.skip_kinds or "").split(",") if s.strip()) or None
+    start_msg_id = args.start_msg_id
 
-
-async def get_message_text_content(page: Page, msg_el) -> str:
-    """提取消息内文本（排除 MessageMeta）。"""
-    try:
-        text_el = msg_el.locator(TEXT_CONTENT_SELECTOR).first
-        if await text_el.count() == 0:
-            return ""
-        # 克隆节点，移除 MessageMeta 再取文本
-        text = await text_el.evaluate("""
-            el => {
-                const clone = el.cloneNode(true);
-                clone.querySelectorAll('.MessageMeta').forEach(n => n.remove());
-                return (clone.textContent || '').trim();
-            }
-        """)
-        return (text or "").strip()
-    except Exception:
-        return ""
-
-
-async def get_group_date_text(page: Page, group_el) -> str:
-    """获取日期组的时间戳文本。"""
-    try:
-        date_el = group_el.locator(STICKY_DATE_SELECTOR).first
-        return (await date_el.inner_text()).strip() if await date_el.count() > 0 else ""
-    except Exception:
-        return ""
-
-
-async def download_via_context_menu(page: Page, element_handle, download_dir: Path, timeout_ms: int = 60000) -> Optional[Path]:
-    """
-    在给定元素上右键 -> 点击 Download，等待下载完成，返回下载文件路径。
-    若未出现 Download 菜单或下载失败则返回 None。
-    """
-    async with page.expect_download(timeout=timeout_ms) as download_info:
-        await element_handle.click(button="right")
-        await page.wait_for_timeout(400)
-        download_btn = page.locator(CONTEXT_MENU_DOWNLOAD_SELECTOR).first
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=args.headless,
+            channel=args.browser_channel if args.browser_channel else None,
+            accept_downloads=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         try:
-            await download_btn.wait_for(state="visible", timeout=3000)
-            await download_btn.click()
-        except Exception:
-            # 关闭可能打开的菜单
-            await page.keyboard.press("Escape")
-            return None
-    try:
-        download: Download = await download_info.value
-        path = await download.path()
-        if path and Path(path).exists():
-            return Path(path)
-    except Exception as e:
-        log(f"下载等待失败: {e}")
-    return None
+            ok = await open_target_channel(page, target_hash)
+            if not ok:
+                log("打开目标频道失败，退出")
+                return
 
+            channel_title = await page.title()
+            channel_slug = slugify(channel_title)
+            out_dir = out_base / channel_slug
+            out_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = out_dir / "manifest.jsonl"
+            summary_path = out_dir / "_channel_summary.txt"
+            summary_path.write_text(
+                f"channel_title={channel_title}\ntarget_hash={target_hash}\nstarted={datetime.now().isoformat()}\n",
+                encoding="utf-8",
+            )
+            log(f"输出目录：{out_dir}")
 
-def move_download_to_group(download_path: Path, group_dir: Path, new_name: str) -> Optional[Path]:
-    """将下载文件移动到组目录并重命名。"""
-    if not download_path or not download_path.exists():
-        return None
-    group_dir.mkdir(parents=True, exist_ok=True)
-    dest = group_dir / safe_filename(new_name)
-    try:
-        shutil.move(str(download_path), str(dest))
-        return dest
-    except Exception as e:
-        log(f"移动文件失败 {download_path} -> {dest}: {e}")
-        return None
+            processed_ids: set[str] = set()
+            global_sg_seq = 0  # 全局 sender-group 序号
+            prev_first_id: Optional[str] = None
+            no_change_rounds = 0
 
+            with manifest_path.open("a", encoding="utf-8") as manifest_fp:
+                for round_idx in range(args.scroll_max):
+                    # 抽取当前 DOM
+                    data = await page.evaluate(EXTRACT_MESSAGES_JS)
+                    if not data.get("containerFound"):
+                        log("DOM 中没有 date-group，等待 …")
+                        await page.wait_for_timeout(1000)
+                        continue
 
-async def process_file_message(page: Page, msg_el, message_id: str, text_pre: str, group_dir: Path):
-    """处理文件类消息：右键 Download -> 等完成 -> 移动到组目录并重命名。"""
-    file_block = msg_el.locator(FILE_MESSAGE_SELECTOR).first
-    if await file_block.count() == 0:
-        return
-    try:
-        title_el = msg_el.locator(FILE_TITLE_SELECTOR).first
-        original_name = (await title_el.get_attribute("title")) or (await title_el.inner_text()) or "file"
-        original_name = original_name.strip()
-    except Exception:
-        original_name = "file"
-    ext = Path(original_name).suffix or ""
-    new_name = f"{message_id}_{text_pre}_file_{original_name}"
-    log(f"下载文件消息 {message_id}: {original_name}")
-    await file_block.scroll_into_view_if_needed()
-    await page.wait_for_timeout(300)
-    got = await download_via_context_menu(page, file_block, DOWNLOAD_DIR)
-    if got and got.exists():
-        move_download_to_group(got, group_dir, new_name)
-    await page.wait_for_timeout(500)
+                    first_id = data.get("firstVisibleId")
+                    last_id = data.get("lastVisibleId")
+                    log(
+                        f"round={round_idx} groups={len(data['dateGroups'])} "
+                        f"first={first_id} last={last_id}"
+                    )
 
+                    # 遍历 date group → sender-group → 消息
+                    current_sg: list[dict] = []  # 累积 sender-group 内的消息
 
-async def process_video_message(page: Page, msg_el, message_id: str, text_pre: str, group_dir: Path):
-    """处理单条视频消息：下载视频 + 保存封面图（截图）。"""
-    media_inner = msg_el.locator(VIDEO_MESSAGE_SELECTOR).first
-    if await media_inner.count() == 0:
-        return
-    await media_inner.scroll_into_view_if_needed()
-    await page.wait_for_timeout(300)
-    # 1) 右键 Download 视频
-    log(f"下载视频消息 {message_id}")
-    got = await download_via_context_menu(page, media_inner, DOWNLOAD_DIR, timeout_ms=90000)
-    if got and got.exists():
-        # 下载的文件名通常为 video_YYYY-MM-DD_HH-MM-SS.mp4
-        stem = got.stem
-        new_name = f"{message_id}_{text_pre}_video_{stem}{got.suffix}"
-        dest = move_download_to_group(got, group_dir, new_name)
-        if dest:
-            log(f"视频已保存: {dest.name}")
-    # 2) 封面图：对 .media-inner 内 thumbnail 截图
-    try:
-        thumb = msg_el.locator(THUMBNAIL_SELECTOR).first
-        if await thumb.count() > 0 and await thumb.is_visible():
-            img_name = f"{message_id}_{text_pre}_video_image.png"
-            dest_img = group_dir / safe_filename(img_name)
-            group_dir.mkdir(parents=True, exist_ok=True)
-            await thumb.screenshot(path=str(dest_img))
-            log(f"视频封面已保存: {dest_img.name}")
-    except Exception as e:
-        log(f"视频封面截图失败: {e}")
-    await page.wait_for_timeout(500)
+                    for dg in data["dateGroups"]:
+                        date_text = dg.get("dateText", "")
+                        yyyymmdd = date_to_yyyymmdd(date_text)
+                        for msg in dg["items"]:
+                            msg_id = msg["id"]
+                            # 新组开始
+                            if msg.get("isFirstInGroup"):
+                                current_sg = []
+                            current_sg.append({"msg": msg, "yyyymmdd": yyyymmdd, "date_text": date_text})
+                            # 组结束 → 处理
+                            if msg.get("isLastInGroup"):
+                                # start_msg_id 过滤：如果整组的所有 msg_id 都 > start_msg_id 则跳过
+                                sg_min_id = min(int(s["msg"]["id"]) for s in current_sg if s["msg"]["id"].isdigit())
+                                if start_msg_id is None or sg_min_id <= start_msg_id:
+                                    await process_sender_group(
+                                        page, current_sg, out_dir, manifest_fp,
+                                        global_sg_seq, processed_ids, args.skip_existing, args.dry_run,
+                                        only_kinds, skip_kinds,
+                                    )
+                                global_sg_seq += 1
+                                current_sg = []
 
+                            if args.max_groups is not None and global_sg_seq >= args.max_groups:
+                                break
+                        if args.max_groups is not None and global_sg_seq >= args.max_groups:
+                            break
 
-async def process_album_item(page: Page, album_item_el, message_id: str, sub_id: str, text_pre: str, group_dir: Path):
-    """处理相册中的一条：可能是视频或图片。"""
-    # 视频：.media-inner video
-    video = album_item_el.locator(VIDEO_TAG_SELECTOR).first
-    has_video = await video.count() > 0
-    if has_video:
-        await album_item_el.scroll_into_view_if_needed()
-        await page.wait_for_timeout(300)
-        got = await download_via_context_menu(page, album_item_el, DOWNLOAD_DIR, timeout_ms=90000)
-        if got and got.exists():
-            stem = got.stem
-            new_name = f"{message_id}_{text_pre}_{sub_id}_video_{stem}{got.suffix}"
-            move_download_to_group(got, group_dir, new_name)
-        try:
-            thumb = album_item_el.locator(THUMBNAIL_SELECTOR).first
-            if await thumb.count() > 0 and await thumb.is_visible():
-                img_name = f"{message_id}_{text_pre}_{sub_id}_video_image.png"
-                dest_img = group_dir / safe_filename(img_name)
-                group_dir.mkdir(parents=True, exist_ok=True)
-                await thumb.screenshot(path=str(dest_img))
-        except Exception:
-            pass
-    else:
-        # 图片：截图整块 media-inner 或其中的 img
-        try:
-            img_el = album_item_el.locator("img.full-media, img.thumbnail").first
-            if await img_el.count() == 0:
-                img_el = album_item_el.locator(".media-inner").first
-            if await img_el.count() > 0 and await img_el.is_visible():
-                img_name = f"{message_id}_{sub_id}_{text_pre}_img.png"
-                dest_img = group_dir / safe_filename(img_name)
-                group_dir.mkdir(parents=True, exist_ok=True)
-                await img_el.screenshot(path=str(dest_img))
-        except Exception:
-            pass
-    await page.wait_for_timeout(400)
+                    if args.max_groups is not None and global_sg_seq >= args.max_groups:
+                        log(f"达到 max-groups={args.max_groups}，停止")
+                        break
 
+                    # 滚动加载更多
+                    changed, new_first = await scroll_up_and_wait(page, first_id)
+                    if not changed:
+                        no_change_rounds += 1
+                        if no_change_rounds >= 3:
+                            log("连续多轮无新消息加载，应该已到顶")
+                            break
+                    else:
+                        no_change_rounds = 0
+                    prev_first_id = new_first
 
-async def process_album_message(page: Page, msg_el, message_id: str, text_pre: str, group_dir: Path):
-    """处理图文集（相册）：遍历每个 album-media-message-XXX。"""
-    album = msg_el.locator(ALBUM_SELECTOR).first
-    if await album.count() == 0:
-        return
-    items = await msg_el.locator(ALBUM_ITEM_SELECTOR).all()
-    for item in items:
-        try:
-            id_attr = await item.get_attribute("id")
-            if id_attr and id_attr.startswith("album-media-message-"):
-                sub_id = id_attr.replace("album-media-message-", "")
-                await process_album_item(page, item, message_id, sub_id, text_pre, group_dir)
-        except Exception as e:
-            log(f"相册子项处理失败: {e}")
-
-
-async def save_text_message(msg_el, message_id: str, text_pre: str, group_dir: Path, text: str):
-    """保存纯文本或带文本消息到 messageid_textpre_text.txt。"""
-    group_dir.mkdir(parents=True, exist_ok=True)
-    name = f"{message_id}_{text_pre}_text.txt"
-    path = group_dir / safe_filename(name)
-    path.write_text(text or "", encoding="utf-8")
-
-
-async def process_comments(page: Page, msg_el, message_id: str, text_pre: str, group_dir: Path):
-    """
-    若消息有评论按钮，点击进入讨论，解析评论组（message-group），
-    保存评论文本与评论内媒体；然后关闭讨论返回。
-    """
-    comment_btn = msg_el.locator(COMMENT_BUTTON_SELECTOR).first
-    if await comment_btn.count() == 0:
-        return
-    try:
-        count_el = comment_btn.locator(".label").first
-        count_text = (await count_el.inner_text()).strip() if await count_el.count() > 0 else "0"
-        # 取数字部分，如 "7 comments" -> "7"
-        m = re.search(r"\d+", count_text)
-        count_text = m.group(0) if m else "0"
-    except Exception:
-        count_text = "0"
-    await comment_btn.scroll_into_view_if_needed()
-    await page.wait_for_timeout(300)
-    await comment_btn.click()
-    await page.wait_for_timeout(2000)
-    # 讨论区可能在右侧或弹层，评论在 .sender-group-container 或 [id^='message-group-'] 下
-    try:
-        groups = await page.locator(".sender-group-container, [id^='message-group-']").all()
-        comments_text = []
-        for g in groups:
+            log(f"完成。共处理 sender-group={global_sg_seq}，msg={len(processed_ids)}")
+        finally:
             try:
-                msg_div = g.locator("[id^='message-'][data-message-id]").first
-                if await msg_div.count() == 0:
-                    continue
-                mid = await msg_div.get_attribute("data-message-id") or ""
-                sender_el = g.locator(".sender-title, .message-title-name").first
-                sender = (await sender_el.inner_text()).strip() if await sender_el.count() > 0 else ""
-                text = await get_message_text_content(page, msg_div)
-                cmt_pre = text_preview(text, 30, default_empty="无文字")
-                comments_text.append(f"[{sender}] {text}")
-                # 评论内相册/视频：简化处理，仅下载可见媒体
-                album = g.locator(ALBUM_SELECTOR).first
-                if await album.count() > 0:
-                    items = await g.locator(ALBUM_ITEM_SELECTOR).all()
-                    for it in items:
-                        try:
-                            aid = await it.get_attribute("id") or ""
-                            sub_id = aid.replace("album-media-message-", "") if aid else ""
-                            video = it.locator(VIDEO_TAG_SELECTOR).first
-                            if await video.count() > 0:
-                                await it.scroll_into_view_if_needed()
-                                await page.wait_for_timeout(200)
-                                got = await download_via_context_menu(page, it, DOWNLOAD_DIR, timeout_ms=60000)
-                                if got and got.exists():
-                                    stem = got.stem
-                                    new_name = f"{message_id}_{text_pre}_comments_{cmt_pre}_{mid}_video_{stem}{got.suffix}"
-                                    move_download_to_group(got, group_dir, new_name)
-                                thumb = it.locator(THUMBNAIL_SELECTOR).first
-                                if await thumb.count() > 0 and await thumb.is_visible():
-                                    img_name = f"{message_id}_{text_pre}_comments_{cmt_pre}_{mid}_video_img.png"
-                                    group_dir.mkdir(parents=True, exist_ok=True)
-                                    await thumb.screenshot(path=str(group_dir / safe_filename(img_name)))
-                            else:
-                                img_el = it.locator("img.full-media, img.thumbnail, .media-inner").first
-                                if await img_el.count() > 0 and await img_el.is_visible():
-                                    img_name = f"{message_id}_{text_pre}_comments_{cmt_pre}_{mid}_img.png"
-                                    group_dir.mkdir(parents=True, exist_ok=True)
-                                    await img_el.screenshot(path=str(group_dir / safe_filename(img_name)))
-                        except Exception:
-                            pass
-            except Exception as e:
-                log(f"评论项解析失败: {e}")
-        if comments_text:
-            group_dir.mkdir(parents=True, exist_ok=True)
-            comment_file = group_dir / safe_filename(f"{message_id}_{text_pre}_comments_{count_text}.txt")
-            comment_file.write_text("\n\n".join(comments_text), encoding="utf-8")
-    except Exception as e:
-        log(f"处理评论失败: {e}")
-    # 关闭讨论：点击返回或关闭按钮
-    await page.wait_for_timeout(500)
-    back_btn = page.locator(".Button.back-button, [aria-label='Back'], .Header .Button").first
-    if await back_btn.count() > 0:
-        try:
-            await back_btn.click()
-            await page.wait_for_timeout(1000)
-        except Exception:
-            pass
+                await ctx.close()
+            except Exception:
+                pass
 
 
-async def process_one_message(page: Page, msg_el, group_dir: Path):
-    """根据消息类型分发：文件 / 视频 / 相册 / 文本 / 评论。"""
-    message_id = (await msg_el.get_attribute("data-message-id")) or (await msg_el.get_attribute("id") or "").replace("message-", "")
-    if not message_id:
+async def process_sender_group(
+    page: Page,
+    sg_msgs: list[dict],
+    out_dir: Path,
+    manifest_fp,
+    sg_seq: int,
+    processed_ids: set[str],
+    skip_existing: bool,
+    dry_run: bool,
+    only_kinds: Optional[set[str]] = None,
+    skip_kinds: Optional[set[str]] = None,
+) -> None:
+    if not sg_msgs:
         return
-    text = await get_message_text_content(page, msg_el)
-    text_pre = text_preview(text, 30)
-    # 跳过系统消息等
-    if "ActionMessage" in (await msg_el.get_attribute("class") or ""):
+    first = sg_msgs[0]
+    first_msg_id = first["msg"]["id"]
+    if first_msg_id in processed_ids:
         return
-    # 1) 文件
-    if await msg_el.locator(FILE_MESSAGE_SELECTOR).first.count() > 0:
-        await process_file_message(page, msg_el, message_id, text_pre, group_dir)
-    # 2) 单条视频（非相册）
-    elif await msg_el.locator(ALBUM_SELECTOR).first.count() == 0 and await msg_el.locator(VIDEO_MESSAGE_SELECTOR).first.count() > 0:
-        await process_video_message(page, msg_el, message_id, text_pre, group_dir)
-    # 3) 相册
-    elif await msg_el.locator(ALBUM_SELECTOR).first.count() > 0:
-        await process_album_message(page, msg_el, message_id, text_pre, group_dir)
-    # 4) 文本（含仅有文本的消息）
-    if text or await msg_el.locator(FILE_MESSAGE_SELECTOR).first.count() == 0:
-        await save_text_message(msg_el, message_id, text_pre, group_dir, text)
-    # 5) 评论
-    await process_comments(page, msg_el, message_id, text_pre, group_dir)
-
-
-async def run_once(page: Page, max_groups: Optional[int] = None, scroll_times: int = 5):
-    """
-    先处理当前可见的消息组（下载完），再滚动加载更多；循环直到滚动次数用完或达到 max_groups。
-    """
-    scroll_parent = MESSAGE_LIST_ROOT_SELECTOR
-    container = page.locator(MESSAGE_LIST_SELECTOR).first
-    # 等到至少出现一个 .message-date-group，否则 all() 会得到空（参考 groups查找方案.md）
-    try:
-        await container.locator(DATE_GROUP_SELECTOR).first.wait_for(state="attached", timeout=15000)
-    except PlaywrightTimeoutError:
-        log("未等到任何 message-date-group，请确认已打开目标频道且消息已加载")
+    yyyymmdd = first["yyyymmdd"]
+    group_dir = out_dir / safe_filename(f"group_{yyyymmdd}_{sg_seq:04d}__{first_msg_id}")
+    log(f"sender-group seq={sg_seq} date={first['date_text']} first_msg={first_msg_id} -> {group_dir.name}")
+    if dry_run:
+        for s in sg_msgs:
+            processed_ids.add(s["msg"]["id"])
+            kinds = []
+            if s["msg"].get("isActionMessage"): kinds.append("action")
+            if s["msg"].get("hasFile"): kinds.append("file")
+            if s["msg"].get("hasAlbum"): kinds.append("album")
+            if s["msg"].get("hasMediaInner") and not s["msg"].get("hasAlbum"): kinds.append("video")
+            if s["msg"].get("hasWebPage"): kinds.append("webpage")
+            if not kinds: kinds.append("text-only")
+            manifest_fp.write(json.dumps({
+                "ts": datetime.now().isoformat(),
+                "sg_seq": sg_seq,
+                "msg_id": s["msg"]["id"],
+                "dry_run": True,
+                "kinds": kinds,
+                "text_len": len(s["msg"].get("text") or ""),
+            }, ensure_ascii=False) + "\n")
+        manifest_fp.flush()
         return
-    # 调试：确认选中的是带 message-date-group 的容器（参考 groups查找方案.md）
-    log(f"msglist_root_count={await page.locator(MESSAGE_LIST_ROOT_SELECTOR).count()}")
-    log(f"container_count={await page.locator(MESSAGE_LIST_SELECTOR).count()}")
-    log(f"date_group_count={await page.locator(MESSAGE_LIST_SELECTOR + ' ' + DATE_GROUP_SELECTOR).count()}")
-    processed_group_ids: set[str] = set()
-    total_group_index = 0
-    for scroll_round in range(scroll_times):
-        groups = await container.locator(DATE_GROUP_SELECTOR).all()
-        log(f"round={scroll_round} groups={len(groups)}")
-        for group_el in groups:
-            if max_groups is not None and total_group_index >= max_groups:
-                break
-            # 用组内第一条消息的 data-message-id 作为组唯一标识，避免滚动后重复处理
-            first_msg = group_el.locator("div.message-list-item[data-message-id]").first
-            if await first_msg.count() == 0:
-                continue
-            group_id = await first_msg.get_attribute("data-message-id") or ""
-            if group_id in processed_group_ids:
-                continue
-            processed_group_ids.add(group_id)
-            date_text = await get_group_date_text(page, group_el)
-            ts = date_to_timestamp(date_text) or "unknown"
-            group_dir = OUT_BASE / f"group_{ts}_{total_group_index}"
-            group_dir.mkdir(parents=True, exist_ok=True)
-            log(f"处理组 [{total_group_index}] {date_text} -> {group_dir.name}")
-            messages = await group_el.locator("div.message-list-item[data-message-id]").all()
-            for msg_el in messages:
-                try:
-                    await process_one_message(page, msg_el, group_dir)
-                except Exception as e:
-                    log(f"消息处理异常: {e}")
-            total_group_index += 1
-        if max_groups is not None and total_group_index >= max_groups:
-            break
-        # 当前可见组都处理完后，再滚动加载更多
-        await scroll_once_to_load_more(page, scroll_parent)
-        await page.wait_for_timeout(1000)
-    log(f"共处理 {total_group_index} 个日期组")
+    group_dir.mkdir(parents=True, exist_ok=True)
+    # 组合 _combined.txt 记录所有消息的纯文本顺序
+    combined_lines: list[str] = []
+    for s in sg_msgs:
+        msg = s["msg"]
+        msg_id = msg["id"]
+        if msg_id in processed_ids:
+            continue
+        loc = page.locator(f"{MESSAGE_LIST_ROOT} #message-{msg_id}").first
+        if await loc.count() == 0:
+            log(f"  消息 {msg_id} 不在 DOM 中，跳过")
+            continue
+        record = await process_message(page, msg, loc, group_dir, manifest_fp, skip_existing, only_kinds, skip_kinds)
+        record["sg_seq"] = sg_seq
+        record["date"] = s["date_text"]
+        record["yyyymmdd"] = yyyymmdd
+        record["ts"] = datetime.now().isoformat()
+        manifest_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+        manifest_fp.flush()
+        processed_ids.add(msg_id)
+        text = msg.get("text") or ""
+        combined_lines.append(f"## msg {msg_id}  ({'+'.join(record['kinds'])})\n{text}\n")
+    if combined_lines:
+        (group_dir / "_combined.md").write_text("\n".join(combined_lines), encoding="utf-8")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Telegram Web 频道消息与媒体下载")
-    parser.add_argument(
-        "--max-groups",
-        type=int,
-        default=None,
-        metavar="N",
-        help="最多处理的日期组数量，不传则处理全部（例: --max-groups 2）",
-    )
-    parser.add_argument(
-        "--scroll-times",
-        type=int,
-        default=5,
-        metavar="N",
-        help="向上滚动加载更多消息的次数（默认 5）",
-    )
-    return parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Telegram Web 频道消息与媒体采集（按 sender-group 输出）")
+    p.add_argument("--target", default=DEFAULT_TARGET, help="目标频道 hash，例如 #-1001395144198")
+    p.add_argument("--out-base", default=str(DEFAULT_OUT_BASE), help="输出根目录，默认 download/output")
+    p.add_argument("--user-data-dir", default=str(DEFAULT_USER_DATA_DIR), help="持久化 profile 目录")
+    p.add_argument("--browser-channel", default="", help="浏览器 channel，留空用 Chromium，可填 msedge/chrome")
+    p.add_argument("--max-groups", type=int, default=None, help="最多处理的 sender-group 数量")
+    p.add_argument("--scroll-max", type=int, default=200, help="最多向上滚动加载次数")
+    p.add_argument("--headless", action="store_true", help="无头运行")
+    p.add_argument("--skip-existing", action="store_true", default=True, help="组目录已有同 msg_id 媒体则跳过下载")
+    p.add_argument("--no-skip-existing", action="store_false", dest="skip_existing", help="强制重新下载")
+    p.add_argument("--dry-run", action="store_true", help="仅识别和记录，不下载")
+    p.add_argument("--only-kinds", default="", help="逗号分隔，只处理指定类型，例 file,video,album,webpage")
+    p.add_argument("--skip-kinds", default="", help="逗号分隔，跳过指定类型")
+    p.add_argument("--start-msg-id", type=int, default=None, help="只处理 msg_id <= 该值的消息（即从历史更早的消息开始；不传则处理可见到的全部）")
+    return p.parse_args()
 
 
-
-
-async def main(max_groups: Optional[int], scroll_times: int):
-    OUT_BASE.mkdir(parents=True, exist_ok=True)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    # 使用 edge_util 获取 page（与 create_book_起点.py 一致）
-    page, release = await get_page(
-        USER_DATA_DIR,
-        headless=False,
-        channel="msedge",
-    )
-    try:
-        log("打开 Telegram Web...")
-        await goto_target_via_entry(page)
-        await page.wait_for_timeout(2000)
-        await run_once(page, max_groups=max_groups, scroll_times=scroll_times)
-    finally:
-        await page.wait_for_timeout(2000)
-        if page:
-            await page.close()
-        await release()
+def main() -> None:
+    args = parse_args()
+    asyncio.run(run(args))
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    asyncio.run(main(max_groups=args.max_groups, scroll_times=args.scroll_times))
+    main()
