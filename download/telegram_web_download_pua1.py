@@ -72,7 +72,8 @@ TEXT_CONTENT = ".text-content"
 WEBPAGE = ".WebPage"
 COMMENT_BUTTON = ".CommentButton"
 
-CONTEXT_MENU_ROOT = ".Menu.MessageContextMenu, .Menu.in-portal.MessageContextMenu"
+CONTEXT_MENU_ROOT = ".Menu.MessageContextMenu"
+# 等待菜单出现时用 .MenuItem 而非 root（root 是 0x0 的 portal 容器）
 CONTEXT_MENU_ITEM = f"{CONTEXT_MENU_ROOT} .MenuItem"
 
 
@@ -230,38 +231,34 @@ async def right_click_download(
         except Exception:
             pass
         await page.wait_for_timeout(500)
+        # 直接用 JS 派发 contextmenu 事件，让 React 接收（最稳）
         try:
-            await locator.hover(timeout=5000)
-            await page.wait_for_timeout(150)
-        except Exception:
-            pass
-        try:
-            await locator.click(button="right", force=True, timeout=5000)
+            await locator.evaluate(
+                """el => {
+                    const r = el.getBoundingClientRect();
+                    const x = r.left + r.width/2, y = r.top + r.height/2;
+                    const opts = { bubbles: true, cancelable: true, view: window,
+                                   button: 2, buttons: 2, clientX: x, clientY: y };
+                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                    el.dispatchEvent(new MouseEvent('mouseup', opts));
+                    el.dispatchEvent(new MouseEvent('contextmenu', opts));
+                }"""
+            )
         except Exception as e:
-            log(f"  右键失败 (attempt {attempt+1}): {e}")
-            continue
-        # 等菜单出现
-        menu_root = page.locator(CONTEXT_MENU_ROOT).first
+            log(f"  JS 派发 contextmenu 失败 (attempt {attempt+1}): {e}")
+            # 兜底：playwright 物理右键
+            try:
+                await locator.click(button="right", force=True, timeout=5000)
+            except Exception as e2:
+                log(f"  物理右键也失败: {e2}")
+                continue
+        # 等菜单出现（用 .MenuItem 而非 .Menu，因为 root 是 0x0 portal 容器）
+        menu_item_any = page.locator(CONTEXT_MENU_ITEM).first
         try:
-            await menu_root.wait_for(state="visible", timeout=4000)
+            await menu_item_any.wait_for(state="visible", timeout=4000)
         except PlaywrightTimeoutError:
             log(f"  右键菜单未出现 (attempt {attempt+1})")
-            # 尝试用 JS dispatch contextmenu event 兜底
-            try:
-                await locator.evaluate(
-                    """el => {
-                        const r = el.getBoundingClientRect();
-                        const ev = new MouseEvent('contextmenu', {
-                            bubbles: true, cancelable: true, view: window,
-                            button: 2, buttons: 2,
-                            clientX: r.left + r.width/2, clientY: r.top + r.height/2
-                        });
-                        el.dispatchEvent(ev);
-                    }"""
-                )
-                await menu_root.wait_for(state="visible", timeout=3000)
-            except Exception:
-                continue
+            continue
         # 找 Download 项
         download_item = page.locator(f"{CONTEXT_MENU_ITEM}:has-text('Download')").first
         try:
