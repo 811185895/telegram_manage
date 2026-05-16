@@ -114,8 +114,21 @@ def date_to_yyyymmdd(date_text: str) -> str:
             return dt.strftime("%Y%m%d")
         except ValueError:
             continue
-    if raw.lower() == "today":
+    low = raw.lower()
+    if low == "today":
         return datetime.now().strftime("%Y%m%d")
+    if low == "yesterday":
+        from datetime import timedelta
+        return (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    # weekday name (Monday..Sunday) → 最近一次该 weekday 的日期（不超过 today）
+    wk = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+    if low in wk:
+        from datetime import timedelta
+        today = datetime.now()
+        delta = (today.weekday() - wk[low]) % 7
+        if delta == 0:
+            delta = 7  # 上周同一天而不是今天
+        return (today - timedelta(days=delta)).strftime("%Y%m%d")
     return safe_filename(raw, 20)
 
 
@@ -378,6 +391,38 @@ async def right_click_download(
             if "crashed" in str(e).lower():
                 raise
             continue
+    return None
+
+
+def video_to_mp3(video_path: Path, mp3_path: Optional[Path] = None, mono: bool = True) -> Optional[Path]:
+    """用 ffmpeg 把视频抽成 mp3。失败返回 None。"""
+    if not video_path.exists() or video_path.stat().st_size < 1024:
+        return None
+    if mp3_path is None:
+        mp3_path = video_path.with_suffix(".mp3").with_name("audio.mp3") if video_path.name == "video.mp4" else video_path.with_suffix(".mp3")
+    if mp3_path.exists() and mp3_path.stat().st_size > 0:
+        return mp3_path  # 已存在
+    import subprocess
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn",  # 跳过视频流
+        "-ac", "1" if mono else "2",
+        "-ab", "64k",  # 语音用 64k 足够
+        "-ar", "22050",
+        "-f", "mp3",
+        str(mp3_path),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=1800)
+        if r.returncode == 0 and mp3_path.exists() and mp3_path.stat().st_size > 0:
+            return mp3_path
+        log(f"  ⚠ ffmpeg returncode={r.returncode}: {r.stderr.decode('utf-8', 'ignore')[-200:]}")
+    except FileNotFoundError:
+        log("  ⚠ ffmpeg 未安装，跳过 mp3 抽取")
+    except subprocess.TimeoutExpired:
+        log("  ⚠ ffmpeg 超时（10 分钟）")
+    except Exception as e:
+        log(f"  ⚠ ffmpeg 异常: {e}")
     return None
 
 
@@ -717,6 +762,10 @@ async def process_message(
                             saved = await save_download(dl, dest)
                             if saved:
                                 record["saved"].append(saved.name)
+                                mp3_dest = msg_dir / safe_filename(f"转写_album_{sub_id}_audio.mp3")
+                                mp3 = video_to_mp3(saved, mp3_dest)
+                                if mp3:
+                                    record["saved"].append(mp3.name)
                         else:
                             record["errors"].append(f"album-video-{sub_id}-no-download")
                 # 真实图（原图 blob）/ canvas 兜底
@@ -748,6 +797,10 @@ async def process_message(
                         saved = await save_download(dl, dest)
                         if saved:
                             record["saved"].append(saved.name)
+                            # 抽 mp3
+                            mp3 = video_to_mp3(saved, msg_dir / "转写_audio.mp3")
+                            if mp3:
+                                record["saved"].append(mp3.name)
                         else:
                             record["errors"].append("video-save-failed")
                     else:
@@ -1511,11 +1564,15 @@ async def run(args) -> None:
     forward_progress = args.forward_progress
 
     async with async_playwright() as p:
+        # playwright 默认把下载临时落在 user_data_dir 旁；指到 out_base 同盘避免占 C/D
+        tmp_dl_dir = out_base / "_pw_downloads"
+        tmp_dl_dir.mkdir(parents=True, exist_ok=True)
         ctx = await p.chromium.launch_persistent_context(
             user_data_dir=str(user_data_dir),
             headless=args.headless,
             channel=args.browser_channel if args.browser_channel else None,
             accept_downloads=True,
+            downloads_path=str(tmp_dl_dir),
             args=["--disable-blink-features=AutomationControlled"],
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -1550,6 +1607,18 @@ async def run(args) -> None:
 
             with manifest_path.open("a", encoding="utf-8") as manifest_fp:
                 for round_idx in range(args.scroll_max):
+                    # 防护：必须在目标群 hash 才能 extract，否则会误采"下载进度"群消息
+                    cur_hash = await page.evaluate("() => location.hash")
+                    if cur_hash != target_hash:
+                        log(f"当前 hash={cur_hash} 不是 target={target_hash}，重走 entry 重定位")
+                        ok2, new_anchor, new_target_hash = await open_via_progress_anchor(page, progress_chat_name)
+                        if not ok2:
+                            log("  ⚠ entry-flow 重定位失败，退出")
+                            break
+                        if new_anchor and new_anchor.isdigit():
+                            anchor_int = max(anchor_int, int(new_anchor))
+                        target_hash = new_target_hash or target_hash
+                        continue
                     data = await page.evaluate(EXTRACT_MESSAGES_JS)
                     if not data.get("containerFound"):
                         log("DOM 中没有 date-group，等待 …")

@@ -15,6 +15,7 @@ download/debug_*.png
 # Runtime log files (per-run)
 download/run_*.log
 download/smoke*.log
+download/audio_batch*.log
 
 # Large or sensitive DOM/media captures used during manual debugging
 download/resources/
