@@ -614,13 +614,22 @@ async def process_message(
 
     msg_dir.mkdir(parents=True, exist_ok=True)
 
-    # 检测是否已经下载过媒体（除 text.md / meta.json / _raw.html / comments/ 之外有任何文件）
-    SKIP_NAMES = {"text.md", "meta.json", "_raw.html"}
-    has_media_files = False
-    for p in msg_dir.iterdir():
-        if p.is_file() and p.name not in SKIP_NAMES:
-            has_media_files = True
-            break
+    # 检测是否已经下载过"主媒体"。thumb / 转写_audio / preview / meta / text 等是侧车，不算。
+    def _is_main_media(name: str) -> bool:
+        if name.startswith("file_"):
+            return True
+        # video.<ext> 但不是 video_thumb.*
+        if name.startswith("video.") or name.startswith("video_") and not name.startswith("video_thumb"):
+            return True
+        # album_<sub>_video.<ext>
+        if name.startswith("album_") and "_video" in name and "_audio" not in name and "_photo" not in name:
+            return True
+        # 单图消息
+        if name in ("photo.png", "photo.jpg", "photo.jpeg", "photo.webp"):
+            return True
+        return False
+
+    has_media_files = any(p.is_file() and _is_main_media(p.name) for p in msg_dir.iterdir())
 
     # 写 meta.json（含完整元数据）+ text.md（人/AI 可读）
     meta = {
