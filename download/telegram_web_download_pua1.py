@@ -394,20 +394,30 @@ async def right_click_download(
     return None
 
 
+def _find_ffmpeg_bin() -> str:
+    import shutil as _sh
+    for c in (r"C:\ProgramData\chocolatey\bin\ffmpeg.exe", "ffmpeg"):
+        p = _sh.which(c) if not Path(c).is_absolute() else (c if Path(c).exists() else None)
+        if p:
+            return p
+    return "ffmpeg"
+
+
 def video_to_mp3(video_path: Path, mp3_path: Optional[Path] = None, mono: bool = True) -> Optional[Path]:
-    """用 ffmpeg 把视频抽成 mp3。失败返回 None。"""
+    """用 ffmpeg + libmp3lame 把视频抽成 mp3。失败返回 None。"""
     if not video_path.exists() or video_path.stat().st_size < 1024:
         return None
     if mp3_path is None:
-        mp3_path = video_path.with_suffix(".mp3").with_name("audio.mp3") if video_path.name == "video.mp4" else video_path.with_suffix(".mp3")
-    if mp3_path.exists() and mp3_path.stat().st_size > 0:
-        return mp3_path  # 已存在
+        mp3_path = video_path.with_name("转写_audio.mp3") if video_path.name == "video.mp4" else video_path.with_suffix(".mp3")
+    if mp3_path.exists() and mp3_path.stat().st_size > 2000:
+        return mp3_path  # 已存在且非 0 字节/header-only
     import subprocess
     cmd = [
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-vn",  # 跳过视频流
+        _find_ffmpeg_bin(), "-y", "-i", str(video_path),
+        "-vn",
+        "-c:a", "libmp3lame",
         "-ac", "1" if mono else "2",
-        "-ab", "64k",  # 语音用 64k 足够
+        "-b:a", "64k",
         "-ar", "22050",
         "-f", "mp3",
         str(mp3_path),
@@ -762,10 +772,7 @@ async def process_message(
                             saved = await save_download(dl, dest)
                             if saved:
                                 record["saved"].append(saved.name)
-                                mp3_dest = msg_dir / safe_filename(f"转写_album_{sub_id}_audio.mp3")
-                                mp3 = video_to_mp3(saved, mp3_dest)
-                                if mp3:
-                                    record["saved"].append(mp3.name)
+                                # mp3 抽取交给独立 batch 进程
                         else:
                             record["errors"].append(f"album-video-{sub_id}-no-download")
                 # 真实图（原图 blob）/ canvas 兜底
@@ -797,10 +804,7 @@ async def process_message(
                         saved = await save_download(dl, dest)
                         if saved:
                             record["saved"].append(saved.name)
-                            # 抽 mp3
-                            mp3 = video_to_mp3(saved, msg_dir / "转写_audio.mp3")
-                            if mp3:
-                                record["saved"].append(mp3.name)
+                            # mp3 抽取交给独立 batch 进程，不阻塞下载主流程
                         else:
                             record["errors"].append("video-save-failed")
                     else:
