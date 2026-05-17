@@ -283,7 +283,12 @@ def main() -> None:
         first = sg[0]
         first_id = first["id"]
         yyyymmdd, _ = msg_iso_date_part(first["date"])
-        group_dir = channel_root / safe_filename(f"group_{yyyymmdd}_{sg_seq:04d}__{first_id}")
+        # 从首条消息文本取标题摘要（前 40 字符）放到目录名后缀
+        first_title = (first.get("text") or "").strip()
+        if not first_title:
+            first_title = "无文本"
+        title_suffix = safe_filename(first_title, 40)
+        group_dir = channel_root / safe_filename(f"group_{yyyymmdd}_{sg_seq:04d}__{first_id}__{title_suffix}", 200)
         for msg in sg:
             mid = msg["id"]
             tp = text_preview(msg.get("text") or "", 30)
