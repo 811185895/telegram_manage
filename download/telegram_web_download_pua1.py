@@ -159,6 +159,10 @@ def slugify(s: str, max_len: int = 60) -> str:
 
 EXTRACT_MESSAGES_JS = r"""
 () => {
+  // 防混淆：只取 MiddleColumn 内最后一个 active slide 里的 MessageList
+  // （chat 切换瞬间可能两个 slide 都是 active，date-group 会跨 chat 混合）
+  const slidesActive = document.querySelectorAll('#MiddleColumn .Transition_slide-active div.Transition.MessageList:has(div.messages-container)');
+  const targetSlide = slidesActive[slidesActive.length - 1] || null;
   // 工具：提取一个消息节点的所有信息
   const extractMsg = (m) => {
     const id = m.getAttribute('data-message-id');
@@ -298,7 +302,8 @@ EXTRACT_MESSAGES_JS = r"""
   };
 
   const out = { containerFound: false, firstVisibleId: null, lastVisibleId: null, dateGroups: [] };
-  const dateGroups = document.querySelectorAll('#MiddleColumn .Transition_slide-active .message-date-group');
+  if (!targetSlide) return out;
+  const dateGroups = targetSlide.querySelectorAll('.message-date-group');
   if (!dateGroups.length) return out;
   out.containerFound = true;
   for (const dg of dateGroups) {
@@ -308,7 +313,7 @@ EXTRACT_MESSAGES_JS = r"""
     msgs.forEach(m => items.push(extractMsg(m)));
     if (items.length) out.dateGroups.push({ dateText, items });
   }
-  const all = document.querySelectorAll('#MiddleColumn .Transition_slide-active .message-list-item[data-message-id]');
+  const all = targetSlide.querySelectorAll('.message-list-item[data-message-id]');
   if (all.length) {
     out.firstVisibleId = all[0].getAttribute('data-message-id');
     out.lastVisibleId = all[all.length-1].getAttribute('data-message-id');
@@ -766,24 +771,21 @@ async def process_message(
                 except Exception:
                     pass
                 if ai.get("hasVideo"):
-                    log(f"  → album video sub={sub_id}")
+                    # album 视频也写 pending 标记，tdl watcher 补
                     try:
-                        dl = await right_click_download(page, item_loc, timeout_ms=1800000, max_attempts=2)
+                        pending = {
+                            "msg_id": int(msg_id) if msg_id.isdigit() else msg_id,
+                            "album_sub_id": sub_id,
+                            "target_path": f"album_{sub_id}_video.mp4",
+                            "channel_hash_id": msg_data.get("_channel_hash_id"),
+                            "created_at": datetime.now().isoformat(),
+                        }
+                        (msg_dir / f"_video_pending_album_{sub_id}.json").write_text(
+                            json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                        record["saved"].append(f"_video_pending_album_{sub_id}.json")
                     except Exception as e:
-                        record["errors"].append(f"album-video-{sub_id}-crash: {e}")
-                        if "crashed" in str(e).lower():
-                            return record
-                    else:
-                        if dl:
-                            suggested = dl.suggested_filename or ""
-                            sfx = Path(suggested).suffix or ".mp4"
-                            dest = msg_dir / safe_filename(f"album_{sub_id}_video{sfx}")
-                            saved = await save_download(dl, dest)
-                            if saved:
-                                record["saved"].append(saved.name)
-                                # mp3 抽取交给独立 batch 进程
-                        else:
-                            record["errors"].append(f"album-video-{sub_id}-no-download")
+                        record["errors"].append(f"album-video-{sub_id}-marker: {e}")
                 # 真实图（原图 blob）/ canvas 兜底
                 try:
                     p = await save_image_for_element(page, item_loc, msg_dir / safe_filename(f"album_{sub_id}_photo"))
@@ -792,33 +794,27 @@ async def process_message(
                 except Exception as e:
                     record["errors"].append(f"album-photo-{sub_id}: {e}")
 
-    # 3) 单视频
+    # 3) 单视频：不在主脚本下载，写 _video_pending.json 标记，交给 tdl watcher 异步补
     if msg_data.get("hasMediaInner") and not msg_data.get("hasAlbum") and not msg_data.get("hasWebPage"):
         record["kinds"].append("video")
         if kind_enabled("video"):
             media = msg_locator.locator(MEDIA_INNER).first
             if await media.count() > 0:
-                log(f"  → video msg={msg_id}（长视频可能需 30 分钟）")
+                # 写 pending 标记（tdl_catchup 会消费）
                 try:
-                    dl = await right_click_download(page, media, timeout_ms=1800000, max_attempts=2)
+                    pending = {
+                        "msg_id": int(msg_id) if msg_id.isdigit() else msg_id,
+                        "target_path": "video.mp4",  # tdl 完成后移到这个文件名
+                        "channel_hash_id": msg_data.get("_channel_hash_id"),
+                        "created_at": datetime.now().isoformat(),
+                    }
+                    (msg_dir / "_video_pending.json").write_text(
+                        json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    record["saved"].append("_video_pending.json")
                 except Exception as e:
-                    record["errors"].append(f"video-crash: {e}")
-                    if "crashed" in str(e).lower():
-                        return record
-                else:
-                    if dl:
-                        suggested = dl.suggested_filename or ""
-                        sfx = Path(suggested).suffix or ".mp4"
-                        dest = msg_dir / safe_filename(f"video{sfx}")
-                        saved = await save_download(dl, dest)
-                        if saved:
-                            record["saved"].append(saved.name)
-                            # mp3 抽取交给独立 batch 进程，不阻塞下载主流程
-                        else:
-                            record["errors"].append("video-save-failed")
-                    else:
-                        record["errors"].append("video-no-download")
-                # 封面：原图 blob → canvas
+                    record["errors"].append(f"video-pending-marker: {e}")
+                # 仍然抓 video_thumb（轻量级 blob fetch，不耗时）
                 try:
                     p = await save_image_for_element(page, media, msg_dir / "video_thumb")
                     if p:
@@ -1274,11 +1270,14 @@ async def scroll_to_top_and_wait(page: Page, prev_first_id: Optional[str], max_w
 
 
 async def scroll_to_bottom_and_wait(page: Page, prev_last_id: Optional[str], max_wait_ms: int = 6000) -> tuple[bool, Optional[str]]:
-    """滚到列表底部加载更新的消息。"""
+    """增量向下滚一段（不直接跳到末尾，避免 viewport 跳到 channel 末端 42xxx 触发 sanity 拒绝）。"""
     await page.evaluate(
         """() => {
             const ml = document.querySelector('#MiddleColumn .Transition_slide-active div.Transition.MessageList');
-            if (ml) ml.scrollTop = ml.scrollHeight;
+            if (ml) {
+                const step = Math.min(ml.clientHeight * 2, 2000);
+                ml.scrollTop = Math.min(ml.scrollTop + step, ml.scrollHeight);
+            }
         }"""
     )
     deadline = asyncio.get_event_loop().time() + max_wait_ms / 1000
@@ -1480,16 +1479,18 @@ async def open_via_progress_anchor(page: Page, progress_chat_name: str) -> tuple
         }"""
     )
     await page.wait_for_timeout(1000)
-    # 找最后一条非 Action 非 placeholder（id 必须是纯整数）的消息
+    # 找**最早**一条非 Action 非 placeholder 的消息（=种子转发）
+    # 改用最早不是最新：避免 main forward 累积后 Focus 跳到错误位置
+    # 种子总是最稳定（用户手动放的）
     last_id = None
     for retry in range(8):
         last_id = await page.evaluate(
             """() => {
                 const msgs = Array.from(document.querySelectorAll('#MiddleColumn .Transition_slide-active .message-list-item[data-message-id]'));
-                for (let i = msgs.length - 1; i >= 0; i--) {
+                for (let i = 0; i < msgs.length; i++) {
                     if (msgs[i].className.includes('ActionMessage')) continue;
                     const id = msgs[i].getAttribute('data-message-id');
-                    if (/^\\d+$/.test(id)) return id;  // 纯整数，跳过 978.000001 这种 placeholder
+                    if (/^\\d+$/.test(id)) return id;
                 }
                 return null;
             }"""
@@ -1594,7 +1595,7 @@ async def run(args) -> None:
             if not ok or not target_hash:
                 log("入口跳转失败，退出。请确认「下载进度」群里至少有一条种子转发消息。")
                 return
-            anchor_int = int(anchor) if anchor and anchor.isdigit() else 0
+            entry_anchor_int = int(anchor) if anchor and anchor.isdigit() else 0
             channel_title = await page.title()
             channel_slug = slugify(channel_title)
             out_dir = out_base / channel_slug
@@ -1605,8 +1606,16 @@ async def run(args) -> None:
                 encoding="utf-8",
             )
             log(f"输出目录：{out_dir}")
-            log(f"anchor={anchor_int}（已下载到这条，新一轮从 > {anchor_int} 开始）")
             progress = load_progress(out_dir)
+            local_anchor_int = int(progress.get("last_anchor_msg_id") or 0)
+            # Sanity check：entry-flow 返回的 anchor 与本地 progress.json 差距过大说明 Focus 跳错位置
+            ANCHOR_JUMP_LIMIT = 5000
+            if local_anchor_int > 0 and entry_anchor_int > local_anchor_int + ANCHOR_JUMP_LIMIT:
+                log(f"⚠ entry-flow anchor={entry_anchor_int} 跳变超过 {ANCHOR_JUMP_LIMIT}（本地={local_anchor_int}），保留本地 anchor")
+                anchor_int = local_anchor_int
+            else:
+                anchor_int = max(local_anchor_int, entry_anchor_int)
+            log(f"anchor={anchor_int}（已下载到这条，新一轮从 > {anchor_int} 开始）")
             progress.update({
                 "channel_title": channel_title,
                 "target_hash": target_hash,
@@ -1640,7 +1649,10 @@ async def run(args) -> None:
                     first_id = data.get("firstVisibleId")
                     last_id = data.get("lastVisibleId")
                     log(f"round={round_idx} groups={len(data['dateGroups'])} first={first_id} last={last_id} anchor={anchor_int}")
-                    # 把消息按 msg_id 升序展开成一个 flat list（只保留 id > anchor 的）
+                    # 把消息按 msg_id 升序展开成 flat list
+                    # 严格限制：anchor < msg.id <= anchor + MAX_BATCH_AHEAD
+                    # 防止 Focus 跳到远处 viewport 时误处理 outliers（曾发生过 anchor 从 451 跳 42664）
+                    MAX_BATCH_AHEAD = 1000
                     flat: list[dict] = []
                     for dg in data["dateGroups"]:
                         date_text = dg.get("dateText", "")
@@ -1650,7 +1662,7 @@ async def run(args) -> None:
                             if not mid.isdigit():
                                 continue
                             v = int(mid)
-                            if v <= anchor_int:
+                            if v <= anchor_int or v > anchor_int + MAX_BATCH_AHEAD:
                                 continue
                             if mid in processed_ids:
                                 continue
@@ -1673,6 +1685,17 @@ async def run(args) -> None:
 
                     if not sgs:
                         no_new_rounds += 1
+                        # 检测 viewport 是否远超 anchor（说明跳到了频道末端），需要往上滚找 anchor+1 附近
+                        first_int = int(first_id) if first_id and first_id.replace('.', '').isdigit() else 0
+                        if first_int > anchor_int + MAX_BATCH_AHEAD:
+                            log(f"  viewport first={first_int} 远超 anchor+{MAX_BATCH_AHEAD}={anchor_int + MAX_BATCH_AHEAD}，向上滚找 anchor+1 附近")
+                            await scroll_to_top_and_wait(page, first_id)
+                            await page.wait_for_timeout(800)
+                            # 滚一次先不退出，下一轮 extract 看
+                            if no_new_rounds >= 3000:
+                                log("  连续 3000 轮没能 scroll 到 anchor 附近，可能频道结构异常，退出")
+                                break
+                            continue
                         if no_new_rounds >= 3:
                             log("连续多轮无新可处理 sender-group，应已到底。结束。")
                             break
@@ -1739,19 +1762,22 @@ async def run(args) -> None:
                         log(f"达到 max-groups={args.max_groups}，停止")
                         break
 
-                    # 处理完后重走 entry flow 重定位 anchor + DOM
+                    # 处理完后：不 re-entry（避免 Focus 跳到错位置 + viewport 反复跳）
+                    # 改为直接 scroll down 加载下一批 newer msg
                     if processed_any_this_round:
-                        ok2, new_anchor, new_target_hash = await open_via_progress_anchor(page, progress_chat_name)
-                        if not ok2:
-                            log("  ⚠ entry-flow 重定位失败，退出")
-                            break
-                        if new_anchor and new_anchor.isdigit():
-                            anchor_int = max(anchor_int, int(new_anchor))
-                        target_hash = new_target_hash or target_hash
+                        # 反复滚直到 last 真的扩展，或多次无变化才认输
+                        for _ in range(3):
+                            changed, _new_last = await scroll_to_bottom_and_wait(page, last_id, max_wait_ms=8000)
+                            if changed:
+                                break
+                            await page.wait_for_timeout(500)
                     else:
-                        # 没处理任何 sg：向下滚加载更新消息
-                        await scroll_to_bottom_and_wait(page, last_id)
-                        await page.wait_for_timeout(800)
+                        # 没处理任何 sg：也是滚动加载
+                        for _ in range(3):
+                            changed, _new_last = await scroll_to_bottom_and_wait(page, last_id, max_wait_ms=8000)
+                            if changed:
+                                break
+                            await page.wait_for_timeout(500)
 
             log(f"完成。处理至 anchor={anchor_int}，sender-group 累计={global_sg_seq}")
         finally:

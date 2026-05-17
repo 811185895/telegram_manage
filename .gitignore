@@ -16,6 +16,14 @@ download/debug_*.png
 download/run_*.log
 download/smoke*.log
 download/audio_batch*.log
+download/audio_watch*.log
+
+# tdl binary + per-run JSON exports
+download/bin/
+download/full_export*.json
+download/test_export*.json
+download/tdl_catchup*.log
+download/tdl_login*.log
 
 # Large or sensitive DOM/media captures used during manual debugging
 download/resources/
